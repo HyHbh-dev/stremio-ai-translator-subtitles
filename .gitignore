@@ -1,3 +1,8 @@
 node_modules/
 .env
 *.log
+
+# 打包产物：exe 与本地 .env 不进仓库，分发包里的说明/脚本保留
+dist/*.exe
+dist/.env
+dist/.env.example

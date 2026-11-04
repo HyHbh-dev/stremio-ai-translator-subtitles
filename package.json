@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node index.js --dev",
-    "test": "node --test test/unit.test.js test/translation-flow.test.js test/e2e.test.js"
+    "test": "node --test test/unit.test.js test/translation-flow.test.js test/e2e.test.js",
+    "build:exe": "pkg . --targets node18-win-x64 --output dist/stremio-ai-subtitles.exe --compress GZip"
   },
   "keywords": [
     "stremio",
@@ -27,5 +28,13 @@
     "stremio-addon-sdk": "^1.6.2",
     "axios": "^1.7.2",
     "dotenv": "^16.4.5"
+  },
+  "pkg": {
+    "assets": [
+      "src/**/*.js"
+    ],
+    "scripts": [
+      "src/**/*.js"
+    ]
   }
 }

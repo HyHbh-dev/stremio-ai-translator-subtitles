@@ -17,6 +17,8 @@
 
 const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 const dotenv = require('dotenv');
+const fs = require('fs');
+const path = require('path');
 const http = require('http');
 const url = require('url');
 const crypto = require('crypto');
@@ -31,8 +33,25 @@ const { renderConfigurePage } = require('./src/configurePage');
 const { probeLegacy } = require('./src/legacyFetcher');
 const { probeCdn } = require('./src/stremioCdnFetcher');
 
-// 加载环境变量
-dotenv.config();
+// 加载环境变量。
+// 打包成 exe 双击运行时，工作目录不一定是程序所在目录，所以先找可执行文件同级的 .env，
+// 再退回当前目录的 .env（源码运行时行为不变）。
+const envCandidates = [
+    path.join(path.dirname(process.execPath), '.env'),
+    path.join(process.cwd(), '.env'),
+];
+const envPath = envCandidates.find((p) => {
+    try {
+        return fs.existsSync(p);
+    } catch {
+        return false;
+    }
+});
+dotenv.config(envPath ? { path: envPath } : undefined);
+
+// pkg 打包后的 exe 会注入 process.pkg；用它区分「源码运行」和「绿色版双击运行」
+const isPackaged = Boolean(process.pkg);
+if (envPath) process.env.__ENV_PATH = envPath;
 
 // 服务端默认配置（可被安装链接里的配置覆盖）
 const config = {
@@ -754,6 +773,36 @@ server.listen(config.port, () => {
     console.log('  2. 点「生成安装链接」，再点「在 Stremio 中安装」');
     console.log('\n或直接用服务端 .env 配置的默认值安装:');
     console.log(`  stremio://localhost:${config.port}/manifest.json\n`);
+    if (isPackaged) {
+        console.log(`提示：这个是绿色版 exe，.env 从 ${process.env.__ENV_PATH || path.dirname(process.execPath)} 读取。`);
+        console.log('      关闭这个窗口程序就停了；想让它常驻，运行「开机自启.bat」。\n');
+        // 双击启动的用户大概率下一步就是去配置页，直接打开省一步
+        if (process.platform === 'win32' && !process.argv.includes('--no-open')) {
+            const { exec } = require('child_process');
+            exec(`start "" "${baseUrl}/configure"`, () => {});
+        }
+    }
+});
+
+// 端口被占用这类错误：源码运行时直接退出，打包成 exe 时不要一闪而过，
+// 否则用户双击后只看到窗口闪一下就没了，完全不知道发生了什么
+server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+        console.error(`\n[启动失败] 端口 ${config.port} 已被占用。`);
+        console.error(`  换个端口：把 .env 里的 PORT 改成 ${config.port + 1} 之类，再重新启动。`);
+    } else if (err.code === 'EACCES') {
+        console.error(`\n[启动失败] 没有权限监听端口 ${config.port}，换一个大于 1024 的端口试试。`);
+    } else {
+        console.error(`\n[启动失败] ${err.message}`);
+    }
+
+    if (isPackaged && process.stdin.isTTY) {
+        console.error('\n按回车键关闭窗口...');
+        process.stdin.resume();
+        process.stdin.once('data', () => process.exit(1));
+    } else {
+        process.exit(1);
+    }
 });
 
 // 优雅退出

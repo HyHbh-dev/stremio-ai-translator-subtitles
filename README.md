@@ -20,18 +20,43 @@ Stremio 播放影视
 
 ## 快速开始
 
-### 1. 安装 Node.js
+### 方式一：绿色版 exe（不用装 Node.js）
+
+直接双击 `stremio-ai-subtitles.exe`，浏览器会自动打开配置页，装进 Stremio 即可。
+程序自带 Node 运行时，整个文件夹拷走就能用。配套文件：
+
+| 文件 | 用途 |
+|---|---|
+| `stremio-ai-subtitles.exe` | 主程序，双击运行（有控制台窗口，方便看日志） |
+| `启动（静默）.vbs` | 同上，但不弹黑窗口 |
+| `开机自启.bat` / `取消开机自启.bat` | 登录 Windows 时自动后台启动 / 取消 |
+| `.env` | 配置，必须和 exe 放在同一目录 |
+| `使用说明.txt` | 给最终用户看的说明 |
+
+自己从源码打包：
+
+```bash
+npm install
+npm run build:exe        # 产出 dist/stremio-ai-subtitles.exe
+```
+
+打包用的是 [pkg](https://github.com/vercel/pkg)，目标 `node18-win-x64`。产物约 40MB，
+首次运行会被杀毒软件扫描一会儿属正常现象。
+
+### 方式二：从源码运行
+
+#### 1. 安装 Node.js
 
 需要 Node.js 16+，从 [nodejs.org](https://nodejs.org) 下载安装。
 
-### 2. 安装依赖
+#### 2. 安装依赖
 
 ```bash
 cd stremio-ai-translator-subtitles
 npm install
 ```
 
-### 3. 配置
+#### 3. 配置
 
 `.env` 里填的是**服务端默认值**，可以全部留空——装到 Stremio 时在 `/configure` 页面填写即可（见第 6 步）。
 
