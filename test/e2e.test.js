@@ -9,6 +9,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 
 const { startFakeOpenSubtitles, startFakeLLM } = require('./helpers/fake-servers');
+const { encodeConfig } = require('../src/addonConfig');
 
 const ROOT = path.join(__dirname, '..');
 
@@ -201,18 +202,83 @@ test('翻译全部失败时不返回伪装成中文的字幕', async (t) => {
     assert.deepStrictEqual(subtitles, [], '翻译全失败时不应返回字幕条目');
 });
 
-test('未配置 OpenSubtitles Key 时拒绝启动', async () => {
-    const child = spawn(process.execPath, ['index.js'], {
-        cwd: ROOT,
-        env: { ...process.env, PORT: '7999', OPENSUBTITLES_API_KEY: '' },
-        stdio: ['ignore', 'pipe', 'pipe'],
+test('未配置 OpenSubtitles Key 时启动只告警，安装链接里的配置优先生效', async (t) => {
+    const openSubs = await startFakeOpenSubtitles();
+    const llm = await startFakeLLM();
+
+    // 服务端完全不带 Key，模拟"装到 Stremio 里再填"
+    const { child, base, getOutput } = await startAddon({
+        OPENSUBTITLES_BASE_URL: openSubs.url,
+        LLM_BASE_URL: llm.url,
+        OPENSUBTITLES_API_KEY: '',
     });
 
-    let output = '';
-    child.stdout.on('data', (d) => (output += d));
-    child.stderr.on('data', (d) => (output += d));
+    t.after(async () => {
+        await stop(child);
+        openSubs.server.close();
+        llm.server.close();
+    });
 
-    const code = await new Promise((resolve) => child.on('exit', resolve));
-    assert.strictEqual(code, 1);
-    assert.ok(output.includes('OPENSUBTITLES_API_KEY'), output);
+    // 没有配置时应返回空列表，而不是崩掉
+    const plain = await (await fetch(`${base}/subtitles/movie/tt0111161.json`)).json();
+    assert.deepStrictEqual(plain.subtitles, []);
+    assert.ok(getOutput().includes('未配置 OPENSUBTITLES_API_KEY'), getOutput());
+
+    // 通过安装链接传入 Key 后即可正常出字幕
+    const token = encodeConfig({ opensubtitlesApiKey: 'key-from-stremio', translateBatchSize: 20 });
+    const res = await fetch(`${base}/c/${token}/subtitles/movie/tt0111161.json`);
+    assert.strictEqual(res.status, 200);
+    const { subtitles } = await res.json();
+    assert.strictEqual(subtitles.length, 1);
+
+    const vtt = await (await fetch(subtitles[0].url)).text();
+    assert.ok(vtt.includes('译文1'));
+});
+
+test('配置页与带配置的 manifest', async (t) => {
+    const openSubs = await startFakeOpenSubtitles();
+    const llm = await startFakeLLM();
+
+    const { child, base } = await startAddon({
+        OPENSUBTITLES_BASE_URL: openSubs.url,
+        LLM_BASE_URL: llm.url,
+        OPENSUBTITLES_API_KEY: 'test-key',
+    });
+
+    t.after(async () => {
+        await stop(child);
+        openSubs.server.close();
+        llm.server.close();
+    });
+
+    // 首页跳到配置页
+    const home = await fetch(`${base}/`, { redirect: 'manual' });
+    assert.strictEqual(home.status, 302);
+    assert.strictEqual(home.headers.get('location'), '/configure');
+
+    const page = await fetch(`${base}/configure`);
+    assert.strictEqual(page.status, 200);
+    const html = await page.text();
+    assert.ok(html.includes('OpenSubtitles API Key'));
+    assert.ok(html.includes('生成安装链接'));
+
+    // 带配置的 manifest：id 与名称随配置变化
+    const tokenA = encodeConfig({ llmModel: 'model-a', opensubtitlesApiKey: 'k' });
+    const tokenB = encodeConfig({ llmModel: 'model-b', opensubtitlesApiKey: 'k' });
+
+    const mfA = await (await fetch(`${base}/c/${tokenA}/manifest.json`)).json();
+    const mfB = await (await fetch(`${base}/c/${tokenB}/manifest.json`)).json();
+
+    assert.strictEqual(mfA.resources[0], 'subtitles');
+    assert.strictEqual(mfA.behaviorHints.configurable, true);
+    assert.notStrictEqual(mfA.id, mfB.id, '不同配置应生成不同的 addon id');
+    assert.ok(mfA.name.includes('model-a'), mfA.name);
+
+    // Stremio 会在 manifest 同级路径打开 configure
+    const cfgPage = await fetch(`${base}/c/${tokenA}/configure`, { redirect: 'manual' });
+    assert.strictEqual(cfgPage.status, 302);
+
+    // 非法配置返回 400 而不是 500
+    const bad = await fetch(`${base}/c/not-a-config/manifest.json`);
+    assert.strictEqual(bad.status, 400);
 });

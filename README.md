@@ -33,18 +33,20 @@ npm install
 
 ### 3. 配置
 
-复制 `.env.example` 为 `.env`，填写配置：
+`.env` 里填的是**服务端默认值**，可以全部留空——装到 Stremio 时在 `/configure` 页面填写即可（见第 6 步）。
 
 ```bash
 cp .env.example .env
 ```
 
-必须配置的两项：
+关键的两项：
 
 | 配置项 | 说明 | 获取方式 |
 |--------|------|----------|
-| `LLM_API_KEY` | 大模型 API Key | [DeepSeek](https://platform.deepseek.com/) / [OpenAI](https://platform.openai.com/) 等平台获取 |
+| `LLM_API_KEY` | 大模型 API Key（本地 Magpie 不需要） | [DeepSeek](https://platform.deepseek.com/) / [OpenAI](https://platform.openai.com/) 等平台获取 |
 | `OPENSUBTITLES_API_KEY` | OpenSubtitles API Key | [opensubtitles.com](https://www.opensubtitles.com/consumers) 注册获取 |
+
+> `/configure` 页面里填写的值会写进安装链接，优先级高于 `.env`。
 
 完整配置项说明：
 
@@ -116,22 +118,38 @@ npm start
   stremio://http://localhost:7000/manifest.json
 ```
 
-### 6. 在 Stremio 中添加插件
+### 6. 在 Stremio 中添加插件（配置模型地址与 OpenSubtitles Key）
 
-**方式一（点击链接）：**
-
-将以下链接复制到浏览器地址栏打开：
+打开配置页：
 
 ```
-stremio://http://localhost:7000/manifest.json
+http://localhost:7000/configure
 ```
 
-**方式二（手动添加）：**
+在页面上填写：
 
-1. 打开 Stremio
-2. 点击右上角「插件」图标（拼图图标）
-3. 在地址栏输入：`http://localhost:7000/manifest.json`
-4. 按 Enter，点击「Install」
+| 字段 | 说明 |
+|------|------|
+| 大模型地址 | OpenAI 兼容接口，如 `http://127.0.0.1:3425/v1`（Magpie）或 `https://api.deepseek.com/v1` |
+| 模型名称 | 如 `bili-translate/Index-Translate-9B`、`deepseek-chat` |
+| 模型 API Key | 本地 Magpie 可留空；云端服务商需要填 |
+| OpenSubtitles API Key | 在 [opensubtitles.com/consumers](https://www.opensubtitles.com/consumers) 申请 |
+| 源/目标语言、每批条数 | 按需调整 |
+
+先点「测试连接」确认两项都通，再点「生成安装链接」，然后：
+
+- 点页面上的「在 Stremio 中安装」按钮（`stremio://` 链接），或
+- 把生成的 `http://localhost:7000/c/xxxx/manifest.json` 粘贴到 Stremio 的插件地址栏
+
+> 配置全部写进安装链接里，所以同一台服务器可以装多个不同配置的实例（换模型、换 Key），互不干扰。
+> 链接里包含 API Key，不要公开分享。
+> 不填的部分会自动回落到服务端 `.env` 的配置。
+
+**使用旧方式（只用 .env 的默认配置）也可以：**
+
+```
+stremio://localhost:7000/manifest.json
+```
 
 ### 7. 使用
 
@@ -153,6 +171,8 @@ stremio-ai-translator-subtitles/
 ├── src/
 │   ├── subtitleFetcher.js    # 字幕获取与解析 (OpenSubtitles API)
 │   ├── translator.js         # 大模型翻译模块 (OpenAI 兼容接口)
+│   ├── addonConfig.js        # 安装链接里的配置编解码
+│   ├── configurePage.js      # /configure 配置页
 │   └── mediaId.js            # Stremio 内容 ID 解析 (电影 / 剧集)
 └── test/                     # 测试 (Node 内置 test runner，无需额外依赖)
     ├── unit.test.js          # 解析、VTT 生成、翻译结果解析

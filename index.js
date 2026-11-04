@@ -9,6 +9,10 @@
  *   2. 从 OpenSubtitles 获取源语言字幕
  *   3. 调用大模型 API 翻译字幕
  *   4. 返回翻译后的 VTT 字幕流 URL
+ *
+ * 配置方式：
+ *   - 服务端 .env（默认值）
+ *   - /configure 页面生成的安装链接（/c/<config>/manifest.json），优先于 .env
  */
 
 const { addonBuilder, getRouter } = require('stremio-addon-sdk');
@@ -16,16 +20,19 @@ const dotenv = require('dotenv');
 const http = require('http');
 const url = require('url');
 const crypto = require('crypto');
+const axios = require('axios');
 const { AsyncLocalStorage } = require('async_hooks');
 
 const { fetchBestSubtitle, entriesToVTT } = require('./src/subtitleFetcher');
 const { translateWithCache, cacheSize } = require('./src/translator');
 const { parseMediaId } = require('./src/mediaId');
+const { decodeConfig, mergeConfig, configHash, buildManifest } = require('./src/addonConfig');
+const { renderConfigurePage } = require('./src/configurePage');
 
 // 加载环境变量
 dotenv.config();
 
-// 配置
+// 服务端默认配置（可被安装链接里的配置覆盖）
 const config = {
     port: parseInt(process.env.PORT || '7000', 10),
     llmApiKey: process.env.LLM_API_KEY || '',
@@ -42,22 +49,11 @@ const config = {
     publicUrl: (process.env.PUBLIC_URL || '').replace(/\/+$/, ''),
 };
 
-// 验证必要配置
-// 注意: LLM_API_KEY 在使用本地 Magpie 服务时可以为空
-const requiredConfigs = [
-    { key: 'opensubtitlesApiKey', label: 'OPENSUBTITLES_API_KEY' },
-];
-const missingConfigs = requiredConfigs.filter(c => !config[c.key]);
-if (missingConfigs.length > 0) {
-    console.error('\n========================================');
-    console.error('  缺少必要配置！');
-    console.error('========================================');
-    missingConfigs.forEach(c => {
-        console.error(`  请在 .env 文件中设置: ${c.label}`);
-    });
-    console.error('  参考 .env.example 文件');
-    console.error('========================================\n');
-    process.exit(1);
+// 缺少 OpenSubtitles Key 时不再直接退出——用户可以在 /configure 页面里填写
+if (!config.opensubtitlesApiKey) {
+    console.warn('\n[警告] 未配置 OPENSUBTITLES_API_KEY。');
+    console.warn('       打开 http://localhost:' + config.port + '/configure 填写后安装；');
+    console.warn('       或在 .env 中配置后重启。\n');
 }
 
 // ============================================
@@ -96,8 +92,16 @@ function sweepExpired() {
 const sweepTimer = setInterval(sweepExpired, 10 * 60 * 1000);
 sweepTimer.unref();
 
-// 保存当前请求的访问来源，用于生成绝对字幕 URL（兼容远程/反代部署）
+// 保存当前请求的访问来源与配置（用于安装链接带来的独立配置）
 const requestContext = new AsyncLocalStorage();
+
+/**
+ * 当前请求生效的配置：链接配置 > 服务端 .env
+ */
+function getConfig() {
+    const store = requestContext.getStore();
+    return (store && store.config) || config;
+}
 
 function resolveOrigin(req) {
     const forwardedProto = req.headers['x-forwarded-proto'];
@@ -141,6 +145,10 @@ const manifest = {
     types: ['movie', 'series'],
     catalogs: [],
     idPrefixes: ['tt'],
+    behaviorHints: {
+        configurable: true,
+        configurationRequired: false,
+    },
 };
 
 const builder = new addonBuilder(manifest);
@@ -150,18 +158,30 @@ const builder = new addonBuilder(manifest);
  * Stremio 播放视频时会请求 subtitles 资源
  */
 builder.defineSubtitlesHandler(async ({ id, type }) => {
-    console.log(`\n[subtitlesHandler] 收到请求: id=${id}, type=${type}`);
+    const cfg = getConfig();
+    console.log(`\n[subtitlesHandler] 收到请求: id=${id}, type=${type}, model=${cfg.llmModel}`);
 
     try {
         // id 可能是 IMDb ID 或 IMDb ID:season:episode
-        const { imdbId, isSeries, season, episode } = parseMediaId(id);
+        const { imdbId, season, episode } = parseMediaId(id);
         if (!/^tt\d+$/.test(imdbId)) {
             console.log(`[subtitlesHandler] 不支持的 id 格式: ${id}`);
             return { subtitles: [] };
         }
 
-        // 构建缓存键（包含模型，切换模型时不会串用缓存）
-        const cacheKey = [id, config.sourceLang, config.targetLang, config.llmModel].join('_');
+        if (!cfg.opensubtitlesApiKey) {
+            console.error('[subtitlesHandler] 未配置 OpenSubtitles API Key，请在 /configure 页面填写');
+            return { subtitles: [] };
+        }
+
+        // 构建缓存键（包含模型与配置指纹，不同安装实例不会串用缓存）
+        const cacheKey = [
+            id,
+            cfg.sourceLang,
+            cfg.targetLang,
+            cfg.llmModel,
+            configHash(cfg).slice(0, 8),
+        ].join('_');
         const subtitleId = `ai-${crypto
             .createHash('sha1')
             .update(cacheKey)
@@ -171,7 +191,7 @@ builder.defineSubtitlesHandler(async ({ id, type }) => {
         const buildEntry = (title) => ({
             id: subtitleId,
             url: `${getBaseUrl()}/subtitle/${subtitleId}.vtt`,
-            lang: LANG_MAP[config.targetLang] || config.targetLang,
+            lang: LANG_MAP[cfg.targetLang] || cfg.targetLang,
             title,
         });
 
@@ -183,8 +203,8 @@ builder.defineSubtitlesHandler(async ({ id, type }) => {
         }
 
         // 1. 从 OpenSubtitles 获取源语言字幕
-        console.log(`[subtitlesHandler] 获取 ${config.sourceLang} 源字幕...`);
-        const subtitleData = await fetchBestSubtitle(imdbId, config, { season, episode });
+        console.log(`[subtitlesHandler] 获取 ${cfg.sourceLang} 源字幕...`);
+        const subtitleData = await fetchBestSubtitle(imdbId, cfg, { season, episode });
 
         if (!subtitleData || !subtitleData.entries || subtitleData.entries.length === 0) {
             console.log('[subtitlesHandler] 未找到可翻译的源字幕');
@@ -197,7 +217,7 @@ builder.defineSubtitlesHandler(async ({ id, type }) => {
         const { entries: translatedEntries, stats } = await translateWithCache(
             cacheKey,
             subtitleData.entries,
-            config,
+            cfg,
             (progress) => {
                 console.log(`[subtitlesHandler] 翻译进度: ${progress}%`);
             }
@@ -216,7 +236,7 @@ builder.defineSubtitlesHandler(async ({ id, type }) => {
         const partial = stats.fallback > 0
             ? ` · ${stats.fallback}/${stats.total} 条未翻译`
             : '';
-        const title = `AI翻译中文字幕 (${config.llmModel})${partial}`;
+        const title = `AI翻译中文字幕 (${cfg.llmModel})${partial}`;
         storeSubtitle(subtitleId, vttContent, title);
 
         // 5. 返回字幕信息给 Stremio
@@ -235,11 +255,111 @@ const addonInterface = builder.getInterface();
 const router = getRouter(addonInterface);
 
 // ============================================
-// 启动 HTTP 服务
-// 同时处理 Stremio SDK 路由 + 自定义字幕文件下载
+// 配置检测接口
 // ============================================
 
-const server = http.createServer((req, res) => {
+function isLoopbackHost(baseUrl) {
+    return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/i.test(baseUrl);
+}
+
+function axiosOptions(cfg, timeout) {
+    return {
+        timeout,
+        proxy: isLoopbackHost(cfg.llmBaseUrl || '') ? false : undefined,
+    };
+}
+
+/**
+ * 检查大模型接口是否可用
+ */
+async function testLLM(cfg) {
+    const base = String(cfg.llmBaseUrl || '').replace(/\/+$/, '');
+    if (!/^https?:\/\//i.test(base)) {
+        return { ok: false, message: '模型地址需要以 http:// 或 https:// 开头' };
+    }
+
+    try {
+        const headers = {};
+        if (cfg.llmApiKey) headers['Authorization'] = `Bearer ${cfg.llmApiKey}`;
+        const res = await axios.get(`${base}/models`, { headers, ...axiosOptions(cfg, 8000) });
+        const models = (res.data && Array.isArray(res.data.data)) ? res.data.data.map((m) => m.id) : [];
+        if (!models.length) {
+            return { ok: true, message: '接口可访问，但没读到模型列表' };
+        }
+        if (cfg.llmModel && !models.includes(cfg.llmModel)) {
+            return { ok: false, message: `接口可访问，但模型列表里没有 ${cfg.llmModel}` };
+        }
+        return { ok: true, message: `${models.length} 个模型可用` };
+    } catch (error) {
+        const status = error.response && error.response.status;
+        if (status === 401 || status === 403) {
+            return { ok: false, message: 'API Key 无效或没有权限' };
+        }
+        return { ok: false, message: `无法连接（${error.message}）` };
+    }
+}
+
+/**
+ * 检查 OpenSubtitles Key 是否可用（只查询不下载，不消耗配额）
+ */
+async function testOpenSubtitles(cfg) {
+    if (!cfg.opensubtitlesApiKey) {
+        return { ok: false, message: '未填写 API Key' };
+    }
+
+    const base = String(cfg.opensubtitlesBaseUrl || 'https://api.opensubtitles.com/api/v1').replace(/\/+$/, '');
+    try {
+        const res = await axios.get(`${base}/subtitles`, {
+            params: { imdb_id: '0111161', languages: 'en' },
+            headers: {
+                'Api-Key': cfg.opensubtitlesApiKey,
+                'User-Agent': cfg.opensubtitlesUserAgent || 'StremioAITranslator v1.0',
+                'Accept': 'application/json',
+            },
+            maxRedirects: 5,
+            timeout: 10000,
+            proxy: isLoopbackHost(base) ? false : undefined,
+        });
+        const count = (res.data && res.data.data && res.data.data.length) || 0;
+        if (!count) {
+            return { ok: true, message: 'Key 有效，但示例影片没查到字幕' };
+        }
+        return { ok: true, message: `Key 有效（示例查询到 ${count} 条字幕）` };
+    } catch (error) {
+        const status = error.response && error.response.status;
+        if (status === 401 || status === 403) {
+            return { ok: false, message: 'API Key 无效' };
+        }
+        if (status === 404) {
+            return { ok: false, message: '接口地址不对，应为 /api/v1' };
+        }
+        return { ok: false, message: `请求失败（${error.message}）` };
+    }
+}
+
+function readJsonBody(req, limit = 16 * 1024) {
+    return new Promise((resolve) => {
+        let body = '';
+        req.on('data', (chunk) => {
+            body += chunk;
+            if (body.length > limit) body = body.slice(0, limit);
+        });
+        req.on('end', () => {
+            try {
+                resolve(JSON.parse(body || '{}'));
+            } catch (_) {
+                resolve({});
+            }
+        });
+    });
+}
+
+// ============================================
+// 启动 HTTP 服务
+// 同时处理 Stremio SDK 路由 + 配置页 + 字幕文件下载
+// ============================================
+
+const server = http.createServer(async (req, res) => {
     const parsedUrl = url.parse(req.url, true);
     const path = parsedUrl.pathname;
 
@@ -254,6 +374,42 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // 首页 → 配置页
+    if (path === '/' && req.method === 'GET') {
+        res.writeHead(302, { Location: '/configure' });
+        res.end();
+        return;
+    }
+
+    // 配置页
+    if (path === '/configure' && req.method === 'GET') {
+        const html = renderConfigurePage({
+            defaults: config,
+            origin: config.publicUrl || resolveOrigin(req) || `http://localhost:${config.port}`,
+            serverHasKeys: {
+                llm: !!config.llmApiKey,
+                opensubtitles: !!config.opensubtitlesApiKey,
+            },
+        });
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+        return;
+    }
+
+    // 配置检测
+    if (path === '/api/test-config' && req.method === 'POST') {
+        const body = await readJsonBody(req);
+        const cfg = mergeConfig(config, body);
+        if (body.llmBaseUrl) cfg.llmBaseUrl = body.llmBaseUrl;
+        if (body.llmApiKey) cfg.llmApiKey = body.llmApiKey;
+        if (body.opensubtitlesApiKey) cfg.opensubtitlesApiKey = body.opensubtitlesApiKey;
+
+        const [llm, opensubtitles] = await Promise.all([testLLM(cfg), testOpenSubtitles(cfg)]);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ llm, opensubtitles }));
+        return;
+    }
+
     // 健康检查端点
     if (path === '/health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -263,10 +419,55 @@ const server = http.createServer((req, res) => {
             model: config.llmModel,
             targetLang: config.targetLang,
             sourceLang: config.sourceLang,
+            configured: {
+                llmApiKey: !!config.llmApiKey,
+                opensubtitles: !!config.opensubtitlesApiKey,
+            },
             cachedSubtitles: translationsStore.size,
             cachedTranslations: cacheSize(),
             uptime: Math.round(process.uptime()),
         }));
+        return;
+    }
+
+    // 带配置的安装链接: /c/<config>/manifest.json 与 /c/<config>/subtitles/...
+    const configRoute = path.match(/^\/c\/([A-Za-z0-9_-]+)\/(manifest\.json|configure|subtitles\/.+)$/);
+    if (configRoute) {
+        const override = decodeConfig(configRoute[1]);
+        if (!override) {
+            res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('配置解析失败，请回到 /configure 重新生成安装链接');
+            return;
+        }
+
+        const cfg = mergeConfig(config, override);
+
+        // Stremio 会在 manifest 同级打开 configure，这里引导回配置页
+        if (configRoute[2] === 'configure') {
+            res.writeHead(302, { Location: '/configure' });
+            res.end();
+            return;
+        }
+
+        if (configRoute[2] === 'manifest.json') {
+            res.writeHead(200, {
+                'Content-Type': 'application/json',
+                'Cache-Control': 'no-store',
+            });
+            res.end(JSON.stringify(buildManifest(manifest, cfg)));
+            return;
+        }
+
+        // 交给 Stremio SDK 路由处理（去掉 /c/<config> 前缀）
+        req.url = `/${configRoute[2]}${parsedUrl.search || ''}`;
+        requestContext.run({ origin: resolveOrigin(req), config: cfg }, () => {
+            router(req, res, () => {
+                if (!res.headersSent) {
+                    res.writeHead(404, { 'Content-Type': 'text/plain' });
+                    res.end('Not Found');
+                }
+            });
+        });
         return;
     }
 
@@ -292,7 +493,7 @@ const server = http.createServer((req, res) => {
 
     // 其他请求交给 Stremio SDK 路由处理
     // 包括: /manifest.json, /subtitles/:type/:id.json 等
-    requestContext.run({ origin: resolveOrigin(req) }, () => {
+    requestContext.run({ origin: resolveOrigin(req), config }, () => {
         router(req, res, () => {
             // 未匹配的路由返回 404
             if (!res.headersSent) {
@@ -304,24 +505,24 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(config.port, () => {
+    const baseUrl = config.publicUrl || `http://localhost:${config.port}`;
     console.log('\n========================================');
     console.log('  AI 字幕翻译插件已启动');
     console.log('========================================');
     console.log(`  服务地址:    http://localhost:${config.port}`);
+    console.log(`  配置页面:    ${baseUrl}/configure`);
     console.log(`  Manifest:    http://localhost:${config.port}/manifest.json`);
     console.log(`  健康检查:     http://localhost:${config.port}/health`);
     console.log(`  大模型:      ${config.llmModel}`);
     console.log(`  翻译方向:    ${config.sourceLang} → ${config.targetLang}`);
     console.log(`  批次大小:    ${config.translateBatchSize} 条/批`);
     console.log(`  字幕来源:    ${config.opensubtitlesBaseUrl}`);
-    if (config.publicUrl) {
-        console.log(`  对外地址:    ${config.publicUrl}`);
-    }
     console.log('========================================');
-    console.log('\n在 Stremio 中添加插件:');
-    console.log(`  stremio://http://localhost:${config.port}/manifest.json`);
-    console.log('\n或手动添加 URL:');
-    console.log(`  http://localhost:${config.port}/manifest.json\n`);
+    console.log('\n安装方式（推荐）：');
+    console.log(`  1. 打开 ${baseUrl}/configure 填写模型地址与 OpenSubtitles Key`);
+    console.log('  2. 点「生成安装链接」，再点「在 Stremio 中安装」');
+    console.log('\n或直接用服务端 .env 配置的默认值安装:');
+    console.log(`  stremio://localhost:${config.port}/manifest.json\n`);
 });
 
 // 优雅退出

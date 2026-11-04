@@ -151,3 +151,90 @@ test('parseTranslationResponse 在序号缺失时保留原文，不做按行硬�
     assert.strictEqual(matched, 0);
     assert.deepStrictEqual(results.map(r => r.text), ['fallback text', 'another text']);
 });
+
+// ============================================
+// 安装配置（/configure 生成的链接）
+// ============================================
+
+const {
+    encodeConfig,
+    decodeConfig,
+    sanitizeConfig,
+    mergeConfig,
+    configHash,
+    buildManifest,
+} = require('../src/addonConfig');
+
+test('encodeConfig / decodeConfig 能往返传递配置', () => {
+    const token = encodeConfig({
+        llmBaseUrl: 'http://127.0.0.1:3425/v1/',
+        llmModel: 'bili-translate/Index-Translate-9B',
+        opensubtitlesApiKey: 'abc123',
+        targetLang: 'zh',
+        translateBatchSize: 40,
+    });
+
+    const cfg = decodeConfig(token);
+    assert.strictEqual(cfg.llmBaseUrl, 'http://127.0.0.1:3425/v1'); // 去掉尾部斜杠
+    assert.strictEqual(cfg.llmModel, 'bili-translate/Index-Translate-9B');
+    assert.strictEqual(cfg.opensubtitlesApiKey, 'abc123');
+    assert.strictEqual(cfg.translateBatchSize, 40);
+});
+
+test('sanitizeConfig 丢弃非法字段但保留合法字段', () => {
+    const cfg = sanitizeConfig({
+        llmBaseUrl: 'ftp://bad',
+        llmModel: 'x',
+        translateBatchSize: 9999,
+        targetLang: 'zh',
+        unknown: 'should be dropped',
+    });
+
+    assert.strictEqual(cfg.llmBaseUrl, undefined);
+    assert.strictEqual(cfg.translateBatchSize, undefined);
+    assert.strictEqual(cfg.targetLang, 'zh');
+    assert.strictEqual(cfg.unknown, undefined);
+});
+
+test('decodeConfig 对垃圾输入返回 null', () => {
+    assert.strictEqual(decodeConfig('not-a-config'), null);
+    assert.strictEqual(decodeConfig(''), null);
+    assert.strictEqual(decodeConfig(Buffer.from('[1,2,3]').toString('base64url')), null);
+});
+
+test('mergeConfig 中链接配置覆盖服务端默认值', () => {
+    const defaults = { llmModel: 'env-model', targetLang: 'zh', opensubtitlesApiKey: '' };
+    const merged = mergeConfig(defaults, { llmModel: 'url-model', opensubtitlesApiKey: 'k' });
+
+    assert.strictEqual(merged.llmModel, 'url-model');
+    assert.strictEqual(merged.opensubtitlesApiKey, 'k');
+    assert.strictEqual(merged.targetLang, 'zh');
+});
+
+test('configHash 区分模型但不泄露 Key 内容', () => {
+    const base = { llmBaseUrl: 'http://x/v1', llmModel: 'm1', targetLang: 'zh', sourceLang: 'en' };
+    assert.notStrictEqual(
+        configHash({ ...base }).slice(0, 8),
+        configHash({ ...base, llmModel: 'm2' }).slice(0, 8)
+    );
+    assert.strictEqual(
+        configHash({ ...base, opensubtitlesApiKey: 'a' }),
+        configHash({ ...base, opensubtitlesApiKey: 'b' })
+    );
+});
+
+test('buildManifest 为不同配置生成不同的 addon', () => {
+    const base = {
+        id: 'org.ai-translator.subtitles',
+        version: '1.0.0',
+        name: 'AI 字幕翻译',
+        behaviorHints: {},
+    };
+    const a = buildManifest(base, { llmModel: 'bili-translate/Index-Translate-9B' });
+    const b = buildManifest(base, { llmModel: 'deepseek-chat' });
+
+    assert.ok(a.id.startsWith('org.ai-translator.subtitles.'));
+    assert.notStrictEqual(a.id, b.id);
+    assert.ok(a.name.includes('Index-Translate-9B'));
+    assert.strictEqual(a.behaviorHints.configurable, true);
+});
