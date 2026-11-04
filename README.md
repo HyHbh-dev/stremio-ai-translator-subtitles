@@ -2,6 +2,17 @@
 
 使用大模型（LLM）自动为没有中文字幕的影视翻译字幕。支持 OpenAI、DeepSeek、Moonshot、通义千问等 OpenAI 兼容接口。
 
+[![最新版本](https://img.shields.io/github/v/release/HyHbh-dev/stremio-ai-translator-subtitles?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC)](https://github.com/HyHbh-dev/stremio-ai-translator-subtitles/releases/latest)
+[![下载量](https://img.shields.io/github/downloads/HyHbh-dev/stremio-ai-translator-subtitles/total)](https://github.com/HyHbh-dev/stremio-ai-translator-subtitles/releases)
+
+**[⬇️ 直接下载](https://github.com/HyHbh-dev/stremio-ai-translator-subtitles/releases/latest)** —— 不用装 Node.js，解压双击即可：
+
+| 平台 | 下载 | 启动方式 |
+|---|---|---|
+| Windows 10/11 x64 | `stremio-ai-subtitles-win64.zip` | 双击 `stremio-ai-subtitles.exe` |
+| macOS Apple 芯片（M1/M2/M3/M4） | `stremio-ai-subtitles-macos.zip` | 双击 `mac-启动.command` |
+| macOS Intel | 同上（包内含 x64 版本） | 双击同一个 `.command`，会自动选架构 |
+
 ## 工作原理
 
 ```
@@ -22,9 +33,11 @@ Stremio 播放影视
 
 ### 方式一：绿色版可执行文件（不用装 Node.js）
 
+从 [Releases](https://github.com/HyHbh-dev/stremio-ai-translator-subtitles/releases/latest) 下载对应压缩包，解压到任意目录。
+
 #### Windows
 
-直接双击 `stremio-ai-subtitles.exe`，浏览器会自动打开配置页，装进 Stremio 即可。
+双击 `stremio-ai-subtitles.exe`，浏览器会自动打开配置页，装进 Stremio 即可。
 程序自带 Node 运行时，整个文件夹拷走就能用。配套文件：
 
 | 文件 | 用途 |
@@ -54,12 +67,18 @@ macOS 强制要求代码签名，未签名的可执行文件会被内核直接�
 npm install
 npm run build:exe          # Windows: dist/stremio-ai-subtitles.exe
 
-# macOS 版本（建议在 Mac 上执行，pkg 会自动做 ad-hoc 签名）
-npx pkg index.js --targets node18-macos-arm64 --output dist/stremio-ai-subtitles-macos-arm64 --compress GZip
+# macOS 版本（在 Windows 上交叉打包需加 --no-bytecode，否则 pkg 无法执行目标平台的 node）
+npx pkg index.js --targets node18-macos-arm64 \
+  --no-bytecode --public-packages "*" --public \
+  --output dist/stremio-ai-subtitles-macos-arm64
 ```
 
 打包用的是 [pkg](https://github.com/vercel/pkg)。Windows 产物约 40MB，macOS 约 50MB，
 首次运行会被系统扫描一会儿属正常现象。
+
+> macOS 产物**未签名**（`--no-bytecode` 无法做签名），直接双击会被系统终止。
+> 分发包里的 `mac-启动.command` 会补上 `chmod +x`、去隔离和 `codesign --force --sign -`。
+> 若要正式分发，请用 Apple 开发者证书签名并公证。
 
 > 在 Windows 上交叉打包 macOS 版本需要加 `--no-bytecode --public-packages "*" --public`
 > （pkg 生成字节码时要执行目标平台的 node 二进制，跨平台跑不了），
