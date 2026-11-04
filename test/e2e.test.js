@@ -329,17 +329,24 @@ test('翻译没完成时先返回部分字幕，后台翻完自动变全量（St
     assert.match(first.subtitles[0].title, /后台翻译中/, first.subtitles[0].title);
     assert.ok(firstMs < 3000, `首屏不该等太久，实际 ${firstMs}ms`);
 
-    const partial = await (await fetch(first.subtitles[0].url)).text();
+    const partialRes = await fetch(first.subtitles[0].url);
+    const partial = await partialRes.text();
     assert.match(partial, /译文1/, '已翻部分应是中文');
     assert.match(partial, /-->/, '时间轴要完整');
+    // 半成品不能被缓存住，否则用户重选字幕也刷不出全量
+    assert.match(partialRes.headers.get('cache-control') || '', /no-store/, partialRes.headers.get('cache-control'));
 
-    // 等后台翻完，再请求应拿到全量
+    // 等后台翻完。关键：不再请求字幕列表，直接用同一个 VTT 地址重拉
+    // （用户在播放器里重选字幕、或从中间开始播放，走的就是这条路径）
     await new Promise((r) => setTimeout(r, 2500));
+    const fullRes = await fetch(first.subtitles[0].url);
+    const full = await fullRes.text();
+    assert.match(full, /译文3/, '后台翻译完成后，同一个 VTT 地址应直接是全量');
+    assert.match(fullRes.headers.get('cache-control') || '', /max-age/, fullRes.headers.get('cache-control'));
+
+    // 字幕列表此时也应该显示为已完成
     const second = await (await fetch(`${base}/subtitles/movie/tt0111161.json`)).json();
     assert.ok(!/后台翻译中/.test(second.subtitles[0].title), second.subtitles[0].title);
-
-    const full = await (await fetch(second.subtitles[0].url)).text();
-    assert.match(full, /译文3/, '后台完成后应包含最后一条译文');
 
     // 整个过程源字幕只应下载一次（OpenSubtitles 配额很贵）
     assert.equal(openSubs.downloads.length, 1, `源字幕只应下载一次，实际 ${openSubs.downloads.length}`);

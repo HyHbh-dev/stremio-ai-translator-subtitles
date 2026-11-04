@@ -18,6 +18,7 @@ const {
 } = require('../src/subtitleFetcher');
 const {
     chunkEntries,
+    interleaveChunks,
     isIndexTranslateModel,
     buildPrompt,
     parseTranslationResponse,
@@ -380,4 +381,29 @@ test('官方 CDN：优先选非听障字幕', async () => {
     } finally {
         cdn.server.close();
     }
+});
+
+test('并发批次分散到全片，而不是全挤在片头（中途开始播放才有中文）', () => {
+    const entries = Array.from({ length: 70 }, (_, i) => ({
+        index: i + 1,
+        startTime: '00:00:01,000',
+        endTime: '00:00:02,000',
+        text: `line ${i + 1}`,
+    }));
+    // 首批 12 条 + 每批 10 条 => 7 批
+    const chunks = [entries.slice(0, 12), ...chunkEntries(entries.slice(12), 10)];
+    assert.strictEqual(chunks.length, 7);
+
+    const ordered = interleaveChunks(chunks, 4);
+    assert.strictEqual(ordered.length, chunks.length, '不能丢批次');
+    assert.deepStrictEqual(ordered[0], chunks[0], '首批（片头）必须留在第一位');
+
+    // 全部批次内容不重不漏
+    const flat = ordered.flat().map((e) => e.index).sort((a, b) => a - b);
+    assert.deepStrictEqual(flat, entries.map((e) => e.index));
+
+    // 前 4 个批次的起始条目应该落在片子不同位置，而不是连着的前 4 批
+    const starts = ordered.slice(0, 4).map((c) => c[0].index);
+    assert.ok(Math.max(...starts) > 40, `起始批次应分散到后半段，实际 ${starts.join(',')}`);
+    assert.strictEqual(new Set(starts).size, 4, '起始批次不能重复');
 });

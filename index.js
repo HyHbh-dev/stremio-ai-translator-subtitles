@@ -109,6 +109,29 @@ function sweepExpired() {
 }
 
 /**
+ * 把一次翻译的最终结果写成 VTT 落库。
+ * 无论是「整片翻完才返回」还是「先给部分结果、后台继续翻」，都走这里，
+ * 保证同一个 subtitleId 最终能拿到全量译文（用户中途重选字幕、或从中间开始播放都需要它）。
+ * @returns {string|null} 成功时返回展示标题，一条都没翻成功则返回 null
+ */
+function finalizeSubtitle(subtitleId, entries, stats, cfg) {
+    if (!stats || !stats.translated) {
+        console.warn(`[subtitlesHandler] 没有可用的译文，不落库: ${subtitleId}`);
+        return null;
+    }
+
+    const vttContent = entriesToVTT(entries);
+    const partial = stats.fallback > 0
+        ? ` · ${stats.fallback}/${stats.total} 条未翻译`
+        : '';
+    const title = `AI翻译中文字幕 (${cfg.llmModel})${partial}`;
+
+    storeSubtitle(subtitleId, vttContent, title, { final: true });
+    console.log(`[subtitlesHandler] 已落库最终字幕: ${subtitleId} (${stats.translated}/${stats.total})`);
+    return title;
+}
+
+/**
  * 等「任意一批翻好」或超时，谁先到返回谁。
  * 用于尽量早地把第一段中文字幕交出去，而不是干等固定时长。
  */
@@ -327,6 +350,13 @@ builder.defineSubtitlesHandler(async ({ id, type }) => {
                 entries: sourceEntries,
                 final: false,
             });
+
+            // 后台跑完后必须把全量结果写回：否则这个 subtitleId 会一直停在快照上，
+            // 用户从中间开始播放、或者重新选一次字幕时，拿到的仍是半成品
+            pending
+                .then(({ entries, stats }) => finalizeSubtitle(subtitleId, entries, stats, cfg))
+                .catch((err) => console.warn(`[subtitlesHandler] 后台翻译收尾失败: ${err.message}`));
+
             console.log(`[subtitlesHandler] 先返回部分结果: ${done.length}/${translatedEntries.length}`);
 
             return { subtitles: [buildEntry(partialTitle)] };
@@ -338,17 +368,14 @@ builder.defineSubtitlesHandler(async ({ id, type }) => {
             return { subtitles: [] };
         }
 
-        // 3. 生成 VTT 字幕
-        const vttContent = entriesToVTT(translatedEntries);
+        // 3. 生成 VTT + 存储翻译结果
+        const title = finalizeSubtitle(subtitleId, translatedEntries, stats, cfg);
+        if (!title) {
+            console.error('[subtitlesHandler] 所有批次翻译均失败，返回空字幕列表');
+            return { subtitles: [] };
+        }
 
-        // 4. 存储翻译结果
-        const partial = stats.fallback > 0
-            ? ` · ${stats.fallback}/${stats.total} 条未翻译`
-            : '';
-        const title = `AI翻译中文字幕 (${cfg.llmModel})${partial}`;
-        storeSubtitle(subtitleId, vttContent, title, { final: true });
-
-        // 5. 返回字幕信息给 Stremio
+        // 4. 返回字幕信息给 Stremio
         const subtitles = [buildEntry(title)];
 
         console.log(`[subtitlesHandler] 返回 ${subtitles.length} 条翻译字幕: ${subtitles[0].url}`);
@@ -676,14 +703,17 @@ const server = http.createServer(async (req, res) => {
     if (path.startsWith('/subtitle/') && path.endsWith('.vtt')) {
         const subtitleId = path.replace('/subtitle/', '').replace('.vtt', '');
 
-        const vttContent = getSubtitle(subtitleId);
-        if (vttContent) {
+        const vttItem = getSubtitleItem(subtitleId);
+        if (vttItem) {
+            // 半成品不能给长缓存：它马上会被后台翻译结果覆盖，
+            // 一旦被播放器或中间的 CDN 缓存住，用户重选字幕也刷不出全量译文
+            const isFinal = vttItem.final !== false;
             res.writeHead(200, {
                 'Content-Type': 'text/vtt; charset=utf-8',
-                'Cache-Control': 'public, max-age=86400',
+                'Cache-Control': isFinal ? 'public, max-age=86400' : 'no-store',
             });
-            res.end(vttContent);
-            console.log(`[http] 返回字幕: ${subtitleId} (${vttContent.length} bytes)`);
+            res.end(vttItem.content);
+            console.log(`[http] 返回字幕: ${subtitleId} (${vttItem.content.length} bytes${isFinal ? '' : ', 翻译中'})`);
         } else {
             res.writeHead(404, { 'Content-Type': 'text/plain' });
             res.end('Subtitle not found');

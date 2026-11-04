@@ -245,6 +245,29 @@ async function translateBatch(entries, config, attempt = 1) {
  * @param {function} onProgress - 进度回调 (0-100)
  * @returns {Promise<{entries: Array, stats: {total, translated, fallback}}>}
  */
+/**
+ * 把「首批 + 顺序批次」重排成「首批 + 分段交错」。
+ * 首批（片头那一小段）保持第一位，其余批次切成 concurrency 个连续段，
+ * 再按段轮转交错取出，这样并发 worker 天然落在片头 / 25% / 50% / 75% 附近，
+ * 用户从任意位置开始播放，都不至于长时间只有原文。
+ */
+function interleaveChunks(chunks, concurrency) {
+    if (concurrency <= 1 || chunks.length <= concurrency + 1) return chunks;
+    const [head, ...rest] = chunks;
+    const seg = Math.ceil(rest.length / concurrency);
+    const parts = [];
+    for (let i = 0; i < rest.length; i += seg) parts.push(rest.slice(i, i + seg));
+
+    const ordered = [];
+    const maxLen = Math.max(...parts.map((part) => part.length));
+    for (let i = 0; i < maxLen; i++) {
+        for (const part of parts) {
+            if (i < part.length) ordered.push(part[i]);
+        }
+    }
+    return [head, ...ordered];
+}
+
 async function translateSubtitles(entries, config, onProgress, options = {}) {
     if (!entries || entries.length === 0) {
         return { entries: [], stats: { total: 0, translated: 0, fallback: 0 } };
@@ -258,11 +281,15 @@ async function translateSubtitles(entries, config, onProgress, options = {}) {
         Math.max(1, Number(config.firstBatchSize) || 12)
     );
 
-    const chunks = firstSize < batchSize && entries.length > firstSize
+    const rawChunks = firstSize < batchSize && entries.length > firstSize
         ? [entries.slice(0, firstSize), ...chunkEntries(entries.slice(firstSize), batchSize)]
         : chunkEntries(entries, batchSize);
     const isIndexModel = isIndexTranslateModel(config.llmModel);
     const concurrency = Math.min(8, Math.max(1, Number(config.translateConcurrency) || 1));
+    // Stremio 请求字幕时不会带播放位置，用户完全可能从中间开始看。
+    // 若所有 worker 都按顺序从片头啃，中途那段要很久才轮得到中文，所以把并发
+    // 分散到全片不同位置；首批仍留在片头，保证从头看的用户先看到连续中文。
+    const chunks = interleaveChunks(rawChunks, concurrency);
     const sink = Array.isArray(options.sink) ? options.sink : null;
 
     console.log(`[translator] 共 ${entries.length} 条字幕，分为 ${chunks.length} 批 (每批 ${batchSize} 条，并发 ${concurrency})`);
@@ -403,6 +430,7 @@ module.exports = {
     translateWithCache,
     getProgressSnapshot,
     chunkEntries,
+    interleaveChunks,
     isIndexTranslateModel,
     buildPrompt,
     parseTranslationResponse,
