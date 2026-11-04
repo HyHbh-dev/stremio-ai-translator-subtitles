@@ -110,6 +110,7 @@ function startFakeLegacy(port = 0) {
  * @param {number} port
  */
 function startFakeOpenSubtitles(port = 0) {
+    const downloads = [];
     const server = http.createServer((req, res) => {
         const reqUrl = new URL(req.url, 'http://127.0.0.1');
 
@@ -149,6 +150,7 @@ function startFakeOpenSubtitles(port = 0) {
             req.on('end', () => {
                 let payload = {};
                 try { payload = JSON.parse(body); } catch (_) {}
+                downloads.push(payload.file_id);
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
                     file_id: payload.file_id,
@@ -171,7 +173,7 @@ function startFakeOpenSubtitles(port = 0) {
 
     return new Promise((resolve) => {
         server.listen(port, '127.0.0.1', () => {
-            resolve({ server, port: server.address().port, url: `http://127.0.0.1:${server.address().port}` });
+            resolve({ server, port: server.address().port, url: `http://127.0.0.1:${server.address().port}`, downloads });
         });
     });
 }
@@ -180,9 +182,12 @@ function startFakeOpenSubtitles(port = 0) {
  * 启动一个假的大模型服务（OpenAI 兼容）
  * 把 "[n] 原文" 翻成 "[n] 译文n"；对包含换行的条目保留换行，用于验证多行字幕不丢行
  * @param {number} port
+ * @param {{delayMs?: number}} [options] delayMs 用于模拟慢模型，验证并发与部分返回
  */
-function startFakeLLM(port = 0) {
+function startFakeLLM(port = 0, options = {}) {
     const calls = [];
+    const delayMs = Number(options.delayMs) || 0;
+    const stats = { active: 0, maxActive: 0 };
 
     const server = http.createServer((req, res) => {
         if (req.method === 'POST' && req.url.endsWith('/chat/completions')) {
@@ -193,16 +198,25 @@ function startFakeLLM(port = 0) {
                 try { payload = JSON.parse(body); } catch (_) {}
                 calls.push(payload);
 
+                stats.active++;
+                stats.maxActive = Math.max(stats.maxActive, stats.active);
+
                 const userMsg = (payload.messages || []).find((m) => m.role === 'user');
                 const out = translatePrompt((userMsg && userMsg.content) || '');
 
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({
-                    id: 'fake',
-                    object: 'chat.completion',
-                    model: payload.model,
-                    choices: [{ index: 0, message: { role: 'assistant', content: out }, finish_reason: 'stop' }],
-                }));
+                const reply = () => {
+                    stats.active--;
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({
+                        id: 'fake',
+                        object: 'chat.completion',
+                        model: payload.model,
+                        choices: [{ index: 0, message: { role: 'assistant', content: out }, finish_reason: 'stop' }],
+                    }));
+                };
+
+                if (delayMs > 0) setTimeout(reply, delayMs);
+                else reply();
             });
             return;
         }
@@ -218,6 +232,7 @@ function startFakeLLM(port = 0) {
                 port: server.address().port,
                 url: `http://127.0.0.1:${server.address().port}/v1`,
                 calls,
+                stats,
             });
         });
     });

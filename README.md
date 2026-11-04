@@ -68,6 +68,9 @@ cp .env.example .env
 | `STREMIO_CDN_URL` | https://opensubtitles-v3.strem.io | 官方插件的 CDN 地址（免 Key 兜底通道） |
 | `OPENSUBTITLES_USER_AGENT` | StremioAITranslator v1.0 | 用户代理标识 |
 | `TRANSLATE_BATCH_SIZE` | 30 | 每批发送给大模型的字幕条数 |
+| `FIRST_BATCH_SIZE` | 12 | 第一批单独用小批量，让首段中文更早出现 |
+| `TRANSLATE_CONCURRENCY` | 4 | 同时向大模型发几批（串行翻译一整部片要几分钟，Stremio 等不了） |
+| `FIRST_RESPONSE_WAIT_MS` | 8000 | 字幕接口最多等多久，到点先返回已翻好的部分 |
 | `CACHE_TTL_HOURS` | 24 | 缓存过期时间 (小时) |
 | `PUBLIC_URL` | - | 对外访问地址，如 `https://sub.example.com`；不填则自动使用请求的 Host |
 

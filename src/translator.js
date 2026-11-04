@@ -245,54 +245,75 @@ async function translateBatch(entries, config, attempt = 1) {
  * @param {function} onProgress - 进度回调 (0-100)
  * @returns {Promise<{entries: Array, stats: {total, translated, fallback}}>}
  */
-async function translateSubtitles(entries, config, onProgress) {
+async function translateSubtitles(entries, config, onProgress, options = {}) {
     if (!entries || entries.length === 0) {
         return { entries: [], stats: { total: 0, translated: 0, fallback: 0 } };
     }
 
     const batchSize = config.translateBatchSize || 30;
-    const chunks = chunkEntries(entries, batchSize);
+    // 第一批故意做小：Stremio 请求字幕有超时，先用一小批换出「第一段中文」，
+    // 后面的批次仍按正常大小跑，整体速度不受影响
+    const firstSize = Math.min(
+        batchSize,
+        Math.max(1, Number(config.firstBatchSize) || 12)
+    );
+
+    const chunks = firstSize < batchSize && entries.length > firstSize
+        ? [entries.slice(0, firstSize), ...chunkEntries(entries.slice(firstSize), batchSize)]
+        : chunkEntries(entries, batchSize);
     const isIndexModel = isIndexTranslateModel(config.llmModel);
-    console.log(`[translator] 共 ${entries.length} 条字幕，分为 ${chunks.length} 批 (每批 ${batchSize} 条)`);
+    const concurrency = Math.min(8, Math.max(1, Number(config.translateConcurrency) || 1));
+    const sink = Array.isArray(options.sink) ? options.sink : null;
+
+    console.log(`[translator] 共 ${entries.length} 条字幕，分为 ${chunks.length} 批 (每批 ${batchSize} 条，并发 ${concurrency})`);
     console.log(`[translator] 模型: ${config.llmModel} ${isIndexModel ? '(Index-Translate 专业翻译模型)' : '(通用大模型)'}`);
 
-    const translatedEntries = [];
+    const perChunk = new Array(chunks.length);
+    let cursor = 0;
     let completed = 0;
     let translatedCount = 0;
 
-    for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        console.log(`[translator] 翻译第 ${i + 1}/${chunks.length} 批 (${chunk.length} 条)...`);
+    const worker = async () => {
+        while (cursor < chunks.length) {
+            const i = cursor++;
+            const chunk = chunks[i];
+            console.log(`[translator] 翻译第 ${i + 1}/${chunks.length} 批 (${chunk.length} 条)...`);
 
-        const { results, matched } = await translateBatch(chunk, config);
-        translatedCount += matched;
+            const { results, matched } = await translateBatch(chunk, config);
+            const map = new Map(results.map(r => [r.index, r.text]));
 
-        const map = new Map(results.map(r => [r.index, r.text]));
-
-        // 将翻译后的文本合并回原始条目 (保留时间轴)
-        for (const entry of chunk) {
-            translatedEntries.push({
+            // 将翻译后的文本合并回原始条目 (保留时间轴)
+            perChunk[i] = chunk.map((entry) => ({
                 index: entry.index,
                 startTime: entry.startTime,
                 endTime: entry.endTime,
                 text: map.has(entry.index) ? map.get(entry.index) : entry.text,
-            });
-        }
+            }));
 
-        completed++;
-        if (onProgress) {
-            const progress = Math.round((completed / chunks.length) * 100);
-            onProgress(progress);
-        }
+            translatedCount += matched;
+            completed++;
 
-        // 批次间短暂延迟 (本地模型不需要延迟)
-        if (i < chunks.length - 1 && !isIndexModel) {
-            await new Promise(resolve => setTimeout(resolve, 300));
+            // 让调用方随时可以读到「已经翻好哪些」，用于先返回部分结果
+            if (sink) sink.push(...perChunk[i]);
+
+            if (onProgress) {
+                const progress = Math.round((completed / chunks.length) * 100);
+                onProgress(progress);
+            }
+
+            // 批次间短暂延迟 (本地模型不需要延迟；有并发时也不需要)
+            if (concurrency === 1 && i < chunks.length - 1 && !isIndexModel) {
+                await new Promise(resolve => setTimeout(resolve, 300));
+            }
         }
-    }
+    };
+
+    await Promise.all(
+        Array.from({ length: Math.min(concurrency, chunks.length) }, () => worker())
+    );
 
     // 按原始顺序排序
-    translatedEntries.sort((a, b) => a.index - b.index);
+    const translatedEntries = perChunk.flat().sort((a, b) => a.index - b.index);
 
     const stats = {
         total: translatedEntries.length,
@@ -304,9 +325,23 @@ async function translateSubtitles(entries, config, onProgress) {
     return { entries: translatedEntries, stats };
 }
 
+// 进行中的翻译任务：同一部片的重复请求（Stremio 会不停重试）共用一个任务，
+// 否则每次重试都从第 1 批重新开始，永远翻不完
+const inflight = new Map();
+// 进行中任务的已完成条目，供"先返回一部分"读取
+const progressSnapshots = new Map();
+
+/**
+ * 读取某个任务当前已翻好的条目（可能为空）
+ */
+function getProgressSnapshot(cacheKey) {
+    const items = progressSnapshots.get(cacheKey);
+    return items ? items.slice() : [];
+}
+
 /**
  * 获取缓存或翻译字幕
- * @returns {Promise<{entries: Array, stats: object, cached: boolean}>}
+ * @returns {Promise<{entries: Array, stats: object, cached: boolean, shared?: boolean}>}
  */
 async function translateWithCache(cacheKey, entries, config, onProgress) {
     const cached = cache.get(cacheKey);
@@ -321,8 +356,30 @@ async function translateWithCache(cacheKey, entries, config, onProgress) {
         cache.delete(cacheKey);
     }
 
-    const result = await translateSubtitles(entries, config, onProgress);
-    cache.set(cacheKey, { result, timestamp: Date.now() });
+    const existing = inflight.get(cacheKey);
+    if (existing) {
+        console.log(`[translator] 复用进行中的翻译任务: ${cacheKey}`);
+        const result = await existing;
+        return { ...result, cached: false, shared: true };
+    }
+
+    const sink = [];
+    progressSnapshots.set(cacheKey, sink);
+
+    const task = (async () => {
+        const result = await translateSubtitles(entries, config, onProgress, { sink });
+        cache.set(cacheKey, { result, timestamp: Date.now() });
+        return result;
+    })().finally(() => {
+        inflight.delete(cacheKey);
+        progressSnapshots.delete(cacheKey);
+    });
+
+    // 后面可能有请求已经放弃等待，避免未处理的 rejection
+    task.catch(() => {});
+    inflight.set(cacheKey, task);
+
+    const result = await task;
     return { ...result, cached: false };
 }
 
@@ -344,10 +401,12 @@ module.exports = {
     translateSubtitles,
     translateBatch,
     translateWithCache,
+    getProgressSnapshot,
     chunkEntries,
     isIndexTranslateModel,
     buildPrompt,
     parseTranslationResponse,
     clearCache,
     cacheSize,
+    _inflightSize: () => inflight.size,
 };

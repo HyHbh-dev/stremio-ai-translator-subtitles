@@ -301,3 +301,47 @@ test('配置页与带配置的 manifest', async (t) => {
     const bad = await fetch(`${base}/c/not-a-config/manifest.json`);
     assert.strictEqual(bad.status, 400);
 });
+
+test('翻译没完成时先返回部分字幕，后台翻完自动变全量（Stremio 重试不再白等）', async (t) => {
+    const openSubs = await startFakeOpenSubtitles();
+    // 慢模型：每批 600ms，模拟本地 9B 逐批翻译的真实节奏
+    const llm = await startFakeLLM(0, { delayMs: 600 });
+
+    const { child, base, getOutput } = await startAddon({
+        OPENSUBTITLES_BASE_URL: openSubs.url,
+        LLM_BASE_URL: llm.url,
+        TRANSLATE_BATCH_SIZE: '1', // 3 条样本字幕 -> 3 批
+        TRANSLATE_CONCURRENCY: '1',
+        FIRST_RESPONSE_WAIT_MS: '300',
+    });
+
+    t.after(async () => {
+        await stop(child);
+        openSubs.server.close();
+        llm.server.close();
+    });
+
+    const started = Date.now();
+    const first = await (await fetch(`${base}/subtitles/movie/tt0111161.json`)).json();
+    const firstMs = Date.now() - started;
+
+    assert.equal(first.subtitles.length, 1, '翻译没完成也应先给出一条可用字幕');
+    assert.match(first.subtitles[0].title, /后台翻译中/, first.subtitles[0].title);
+    assert.ok(firstMs < 3000, `首屏不该等太久，实际 ${firstMs}ms`);
+
+    const partial = await (await fetch(first.subtitles[0].url)).text();
+    assert.match(partial, /译文1/, '已翻部分应是中文');
+    assert.match(partial, /-->/, '时间轴要完整');
+
+    // 等后台翻完，再请求应拿到全量
+    await new Promise((r) => setTimeout(r, 2500));
+    const second = await (await fetch(`${base}/subtitles/movie/tt0111161.json`)).json();
+    assert.ok(!/后台翻译中/.test(second.subtitles[0].title), second.subtitles[0].title);
+
+    const full = await (await fetch(second.subtitles[0].url)).text();
+    assert.match(full, /译文3/, '后台完成后应包含最后一条译文');
+
+    // 整个过程源字幕只应下载一次（OpenSubtitles 配额很贵）
+    assert.equal(openSubs.downloads.length, 1, `源字幕只应下载一次，实际 ${openSubs.downloads.length}`);
+    assert.ok(!getOutput().includes('所有批次翻译均失败'), getOutput());
+});

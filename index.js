@@ -24,7 +24,7 @@ const axios = require('axios');
 const { AsyncLocalStorage } = require('async_hooks');
 
 const { fetchBestSubtitle, entriesToVTT } = require('./src/subtitleFetcher');
-const { translateWithCache, translateBatch, cacheSize } = require('./src/translator');
+const { translateWithCache, translateBatch, cacheSize, getProgressSnapshot } = require('./src/translator');
 const { parseMediaId } = require('./src/mediaId');
 const { decodeConfig, mergeConfig, configHash, buildManifest } = require('./src/addonConfig');
 const { renderConfigurePage } = require('./src/configurePage');
@@ -52,6 +52,12 @@ const config = {
     // 字幕源：auto = 新版 → 旧版 → 官方 CDN 依次尝试；rest / legacy / cdn = 只用指定通道
     subtitleSource: process.env.SUBTITLE_SOURCE || 'auto',
     translateBatchSize: parseInt(process.env.TRANSLATE_BATCH_SIZE || '30', 10),
+    // 第一批单独用小批量，换取更快的「首段中文」（其余批次按 TRANSLATE_BATCH_SIZE）
+    firstBatchSize: parseInt(process.env.FIRST_BATCH_SIZE || '12', 10),
+    // 同时向大模型发多少批。串行翻译一整部片要几分钟，Stremio 等不了
+    translateConcurrency: parseInt(process.env.TRANSLATE_CONCURRENCY || '4', 10),
+    // 字幕接口最多等多久（毫秒）再先把已翻好的部分返回
+    firstResponseWaitMs: parseInt(process.env.FIRST_RESPONSE_WAIT_MS || '8000', 10),
     cacheTtlHours: parseInt(process.env.CACHE_TTL_HOURS || '24', 10),
     // 反向代理 / 远程部署时，用于生成对外可访问的字幕地址
     publicUrl: (process.env.PUBLIC_URL || '').replace(/\/+$/, ''),
@@ -71,8 +77,13 @@ if (!config.opensubtitlesApiKey && config.subtitleSource !== 'legacy') {
 const translationsStore = new Map(); // subtitleId -> { content, title, expiresAt }
 const STORE_TTL_MS = Math.max(1, config.cacheTtlHours) * 60 * 60 * 1000;
 
-function storeSubtitle(subtitleId, content, title) {
-    translationsStore.set(subtitleId, { content, title, expiresAt: Date.now() + STORE_TTL_MS });
+function storeSubtitle(subtitleId, content, title, extra = {}) {
+    translationsStore.set(subtitleId, {
+        content,
+        title,
+        expiresAt: Date.now() + STORE_TTL_MS,
+        ...extra,
+    });
 }
 
 function getSubtitleItem(subtitleId) {
@@ -95,6 +106,33 @@ function sweepExpired() {
     for (const [key, item] of translationsStore) {
         if (item.expiresAt <= now) translationsStore.delete(key);
     }
+}
+
+/**
+ * 等「任意一批翻好」或超时，谁先到返回谁。
+ * 用于尽量早地把第一段中文字幕交出去，而不是干等固定时长。
+ */
+async function firstProgressSignal(cacheKey, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (getProgressSnapshot(cacheKey).length > 0) return true;
+        await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    return getProgressSnapshot(cacheKey).length > 0;
+}
+
+/**
+ * 等第一批译文产出，最多等 timeoutMs。
+ * Stremio 请求字幕有超时，但如果一条译文都没有就返回，用户那边是什么都看不到，
+ * 所以宁可再等一会儿，先给出一段中文字幕。
+ */
+async function waitUntilFirstProgress(cacheKey, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (getProgressSnapshot(cacheKey).length > 0) return true;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    return getProgressSnapshot(cacheKey).length > 0;
 }
 
 const sweepTimer = setInterval(sweepExpired, 10 * 60 * 1000);
@@ -203,33 +241,96 @@ builder.defineSubtitlesHandler(async ({ id, type }) => {
             title,
         });
 
-        // 已有缓存时直接返回，避免重复下载源字幕（OpenSubtitles 匿名配额只有 5 次/天）
+        // 已完整翻译过：直接返回，避免重复下载源字幕（OpenSubtitles 匿名配额只有 5 次/天）
         const cachedItem = getSubtitleItem(subtitleId);
-        if (cachedItem) {
+        if (cachedItem && cachedItem.final) {
             console.log(`[subtitlesHandler] 命中已有翻译结果: ${subtitleId}`);
             return { subtitles: [buildEntry(cachedItem.title)] };
         }
 
-        // 1. 从 OpenSubtitles 获取源语言字幕
-        console.log(`[subtitlesHandler] 获取 ${cfg.sourceLang} 源字幕...`);
-        const subtitleData = await fetchBestSubtitle(imdbId, cfg, { season, episode });
+        // 上次只返回了部分结果时，源字幕已经抓过，直接复用，不再消耗下载配额
+        let sourceEntries = cachedItem && Array.isArray(cachedItem.entries) ? cachedItem.entries : null;
 
-        if (!subtitleData || !subtitleData.entries || subtitleData.entries.length === 0) {
-            console.log('[subtitlesHandler] 未找到可翻译的源字幕');
-            return { subtitles: [] };
+        if (sourceEntries) {
+            console.log(`[subtitlesHandler] 复用已抓取的 ${sourceEntries.length} 条源字幕，继续翻译`);
+        } else {
+            // 1. 从 OpenSubtitles 获取源语言字幕
+            console.log(`[subtitlesHandler] 获取 ${cfg.sourceLang} 源字幕...`);
+            const subtitleData = await fetchBestSubtitle(imdbId, cfg, { season, episode });
+
+            if (!subtitleData || !subtitleData.entries || subtitleData.entries.length === 0) {
+                console.log('[subtitlesHandler] 未找到可翻译的源字幕');
+                return { subtitles: [] };
+            }
+            sourceEntries = subtitleData.entries;
         }
 
-        console.log(`[subtitlesHandler] 获取到 ${subtitleData.entries.length} 条源字幕，开始翻译...`);
+        console.log(`[subtitlesHandler] 共 ${sourceEntries.length} 条源字幕，开始翻译...`);
 
         // 2. 调用大模型翻译
-        const { entries: translatedEntries, stats } = await translateWithCache(
+        //    Stremio 请求字幕有超时，整片翻完要几十秒到几分钟，所以：
+        //    - 同一部片只跑一个翻译任务（重复请求挂在同一个任务上，不重头再来）
+        //    - 限时等待，到点先把「已翻好的部分」返回，后台继续翻，下次请求就能拿到全量
+        const pending = translateWithCache(
             cacheKey,
-            subtitleData.entries,
+            sourceEntries,
             cfg,
             (progress) => {
                 console.log(`[subtitlesHandler] 翻译进度: ${progress}%`);
             }
         );
+
+        const waitMs = Math.max(1000, Number(cfg.firstResponseWaitMs) || 8000);
+        // 谁先到算谁：整片翻完，或者「任意一批已翻好」——后者能让第一段中文尽早出现
+        const settled = await Promise.race([
+            pending.then((value) => ({ kind: 'done', value })),
+            firstProgressSignal(cacheKey, waitMs).then((ok) => ({ kind: ok ? 'progress' : 'timeout' })),
+        ]);
+
+        let translatedEntries;
+        let stats;
+
+        if (settled.kind === 'done') {
+            ({ entries: translatedEntries, stats } = settled.value);
+        } else {
+            // 到点仍无任何译文时，再宽限一会儿等首批，否则用户那边完全看不到这条字幕
+            if (settled.kind === 'timeout') {
+                console.warn(`[subtitlesHandler] ${waitMs}ms 内尚无任何译文，再等首批…`);
+                await waitUntilFirstProgress(cacheKey, 8000);
+            }
+
+            const done = getProgressSnapshot(cacheKey);
+            if (done.length === 0) {
+                console.warn('[subtitlesHandler] 仍未产出任何译文，先返回空，后台继续翻译');
+                return { subtitles: [] };
+            }
+
+            // 已翻的用译文，没翻的保留原文，保证整片都有字幕可看
+            const byIndex = new Map(done.map((entry) => [entry.index, entry.text]));
+            translatedEntries = sourceEntries.map((entry) => ({
+                index: entry.index,
+                startTime: entry.startTime,
+                endTime: entry.endTime,
+                text: byIndex.has(entry.index) ? byIndex.get(entry.index) : entry.text,
+            }));
+            stats = {
+                total: translatedEntries.length,
+                translated: done.length,
+                fallback: translatedEntries.length - done.length,
+                partial: true,
+            };
+
+            const partialVtt = entriesToVTT(translatedEntries);
+            const partialTitle = `AI翻译中文字幕 (${cfg.llmModel}) · 后台翻译中 ${done.length}/${translatedEntries.length}`;
+            // 记住源字幕，后续请求不用再下载（配额很贵）
+            storeSubtitle(subtitleId, partialVtt, partialTitle, {
+                entries: sourceEntries,
+                final: false,
+            });
+            console.log(`[subtitlesHandler] 先返回部分结果: ${done.length}/${translatedEntries.length}`);
+
+            return { subtitles: [buildEntry(partialTitle)] };
+        }
 
         // 整条字幕一条都没翻译成功时，不要假装"已翻译"（否则用户会看到英文字幕被标成 AI 中文字幕）
         if (stats.translated === 0) {
@@ -245,7 +346,7 @@ builder.defineSubtitlesHandler(async ({ id, type }) => {
             ? ` · ${stats.fallback}/${stats.total} 条未翻译`
             : '';
         const title = `AI翻译中文字幕 (${cfg.llmModel})${partial}`;
-        storeSubtitle(subtitleId, vttContent, title);
+        storeSubtitle(subtitleId, vttContent, title, { final: true });
 
         // 5. 返回字幕信息给 Stremio
         const subtitles = [buildEntry(title)];
