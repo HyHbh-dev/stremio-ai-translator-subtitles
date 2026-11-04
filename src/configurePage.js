@@ -19,13 +19,20 @@ function renderConfigurePage({ defaults, origin, serverHasKeys }) {
         .join('');
 
     const sourceOptions = (current) => [
-        ['auto', '自动（新版 → 旧版 → 官方 CDN 依次尝试）'],
+        ['auto', '自动（推荐）'],
         ['cdn', 'Stremio 官方 CDN（免 Key，不限次数）'],
-        ['rest', '新版 REST（必须填 Key）'],
+        ['rest', '新版 REST（必须填 Key，匿名 5 次/天）'],
         ['legacy', '旧接口 XML-RPC（免 Key，下载需账号）'],
     ]
         .map(([code, label]) => `<option value="${code}"${code === (current || 'auto') ? ' selected' : ''}>${label}</option>`)
         .join('');
+
+    const SOURCE_NOTES = {
+        auto: '默认。有 Key 先走新版接口，没 Key 直接走官方 CDN，都不会额外消耗你的下载次数。不确定就选这个。',
+        cdn: '完全不填 Key 也能用，字幕直接取 Stremio 官方缓存（实测 1686 条无限制）。代价是借用第三方服务，它的接口哪天变了就得跟着改。',
+        rest: '用你自己的 OpenSubtitles Key。匿名每天只有 5 次下载，超了返回 406；译文有缓存，同一部片重复播放不会重复扣。',
+        legacy: '免 Key 也能搜到候选列表，但匿名下载只会拿到 102 字节的「成为 OpenSubtitles VIP」占位字幕。必须填下面的账号密码才有真字幕，否则会被判失败。',
+    };
 
     return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -116,10 +123,11 @@ function renderConfigurePage({ defaults, origin, serverHasKeys }) {
       <input id="llmApiKey" type="password" autocomplete="off" placeholder="sk-..." />
     </div>
     <div class="row">
-      <label>字幕源 <span class="hint">官方 CDN 是免 Key 无限次的兜底；旧接口匿名下载只会拿到 VIP 占位字幕</span></label>
+      <label>字幕源 <span class="hint">决定从哪儿取英文字幕，下面会显示当前选项的代价</span></label>
       <select id="subtitleSource">
         ${sourceOptions(defaults.subtitleSource)}
       </select>
+      <div id="sourceNote" class="hint" style="margin-top:6px;line-height:1.6"></div>
     </div>
     <div class="row">
       <label>OpenSubtitles API Key <span class="hint">${serverHasKeys.opensubtitles ? '服务端已配置，可留空' : '选「官方 CDN」或「旧接口」时可留空'}</span></label>
@@ -190,6 +198,16 @@ function renderConfigurePage({ defaults, origin, serverHasKeys }) {
   const ORIGIN = ${JSON.stringify(origin)};
 
   const $ = (id) => document.getElementById(id);
+
+  // 字幕源说明：跟着下拉框走，避免用户在四个选项之间猜代价
+  const SOURCE_NOTES = ${JSON.stringify(SOURCE_NOTES)};
+
+  function syncSourceNote() {
+    const note = $('sourceNote');
+    if (note) note.textContent = SOURCE_NOTES[$('subtitleSource').value] || '';
+  }
+  $('subtitleSource').addEventListener('change', syncSourceNote);
+  syncSourceNote();
 
   function escapeHtml(s) {
     return String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({
