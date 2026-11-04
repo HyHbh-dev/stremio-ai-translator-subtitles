@@ -616,7 +616,7 @@ server.listen(config.port, () => {
     console.log(`  大模型:      ${config.llmModel}`);
     console.log(`  翻译方向:    ${config.sourceLang} → ${config.targetLang}`);
     console.log(`  批次大小:    ${config.translateBatchSize} 条/批`);
-    console.log(`  字幕源:      ${config.subtitleSource}${config.subtitleSource === 'auto' ? '（新版优先，失败回退旧接口）' : ''}`);
+    console.log(`  字幕源:      ${config.subtitleSource}${config.subtitleSource === 'auto' ? '（新版 → 旧版 → 官方 CDN 依次尝试）' : ''}`);
     console.log('========================================');
     console.log('\n安装方式（推荐）：');
     console.log(`  1. 打开 ${baseUrl}/configure 填写模型地址与 OpenSubtitles Key`);
