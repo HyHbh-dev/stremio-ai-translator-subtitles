@@ -1,0 +1,27 @@
+{
+  "name": "stremio-ai-translator-subtitles",
+  "version": "1.0.0",
+  "description": "Stremio addon that uses LLM to translate subtitles into Chinese when no Chinese subtitles are available",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js --dev"
+  },
+  "keywords": [
+    "stremio",
+    "addon",
+    "subtitles",
+    "ai",
+    "translation",
+    "llm",
+    "openai",
+    "deepseek"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "stremio-addon-sdk": "^1.6.2",
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5"
+  }
+}
