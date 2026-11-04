@@ -1,0 +1,94 @@
+========================================
+ Stremio AI 字幕翻译插件 · macOS 版
+========================================
+
+
+【一、启动】
+
+解压后，双击  mac-启动.command
+
+它会自动做三件事（macOS 对可执行文件有强制签名要求，不做会被系统直接杀掉）：
+  1. chmod +x      给执行权限
+  2. xattr -d      解除下载隔离标记
+  3. codesign -s - 做 ad-hoc 签名
+
+启动后浏览器会自动打开：
+    http://127.0.0.1:7000/configure
+
+如果双击提示"无法打开，因为无法验证开发者"：
+  右键点这个文件 → 打开 → 再点"打开"。
+
+如果提示"权限不足"：
+  打开「终端」，输入 chmod +x 然后把文件拖进终端窗口，回车。
+  之后就能双击了。
+
+Apple 芯片（M1/M2/M3/M4）用 macos-arm64，Intel 芯片用 macos-x64，
+脚本会根据 uname -m 自动选，不用你操心。
+
+
+【二、开机自动启动（可选）】
+
+1. 把整个文件夹放到一个固定位置，比如：
+       /Users/你的用户名/Applications/stremio-ai-subtitles/
+
+2. 复制 com.stremio.ai-subtitles.plist 到：
+       ~/Library/LaunchAgents/
+
+3. 编辑这个 plist，把里面的路径改成你的真实路径和用户名。
+
+4. 终端执行：
+       launchctl load ~/Library/LaunchAgents/com.stremio.ai-subtitles.plist
+
+取消自启：
+       launchctl unload ~/Library/LaunchAgents/com.stremio.ai-subtitles.plist
+
+
+【三、配置（重要，和 Windows 版不一样的地方）】
+
+.env 必须和可执行文件放在同一个文件夹。
+
+最需要注意的一点：**模型地址不能盲抄 127.0.0.1**。
+
+  情况 A：模型就跑在这台 Mac 上
+       LLM_BASE_URL=http://127.0.0.1:3425/v1
+       （macOS 版 Magpie，或者任何本地推理服务）
+
+  情况 B：模型跑在局域网里另一台 Windows 机器上
+       LLM_BASE_URL=http://192.168.1.10:3425/v1   ← 换成那台机器的局域网 IP
+       并且那台机器上的服务必须监听 0.0.0.0，只绑 127.0.0.1 的话 Mac 连不上。
+
+  情况 C：用云端 API
+       LLM_BASE_URL=https://api.deepseek.com/v1
+       LLM_API_KEY=你的key
+
+怎么判断通不通：打开 /configure 点「测试连接」，
+大模型那一项显示「67 个模型可用」之类就说明通了。
+
+
+【四、装进 Stremio】
+
+Stremio for Mac 里安装：
+    http://127.0.0.1:7000/manifest.json
+
+或者用 /configure 生成的 stremio:// 链接。
+
+装一次就永久保留，重启不用重装。
+只有改了配置（模型、端口）才需要重新装一次。
+
+
+【五、常见问题】
+
+Q: 双击 .command 只闪一下就没了？
+A: 用终端手动运行看报错：
+       cd 到文件夹
+       ./mac-启动.command
+
+Q: 提示 "killed" 或 "zsh: killed"？
+A: 签名没做成功。手动执行一次：
+       codesign --force --sign - ./stremio-ai-subtitles-macos-arm64
+
+Q: 端口被占用？
+A: 改 .env 里的 PORT，或者在终端里 lsof -i :7000 看谁占着。
+
+Q: 和 Windows 版能同时用吗？
+A: 能，但 Stremio 里会出现两个同名插件，建议只留一个。

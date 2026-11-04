@@ -774,12 +774,21 @@ server.listen(config.port, () => {
     console.log('\n或直接用服务端 .env 配置的默认值安装:');
     console.log(`  stremio://localhost:${config.port}/manifest.json\n`);
     if (isPackaged) {
-        console.log(`提示：这个是绿色版 exe，.env 从 ${process.env.__ENV_PATH || path.dirname(process.execPath)} 读取。`);
-        console.log('      关闭这个窗口程序就停了；想让它常驻，运行「开机自启.bat」。\n');
+        const platformHint = process.platform === 'win32'
+            ? '想让它常驻，运行「开机自启.bat」。'
+            : `想让它常驻，把 com.stremio.ai-subtitles.plist 放进 ~/Library/LaunchAgents/ 后执行 launchctl load。`;
+        console.log(`提示：这是打包好的可执行文件，.env 从 ${process.env.__ENV_PATH || path.dirname(process.execPath)} 读取。`);
+        console.log(`      ${platformHint}\n`);
         // 双击启动的用户大概率下一步就是去配置页，直接打开省一步
-        if (process.platform === 'win32' && !process.argv.includes('--no-open')) {
+        if (!process.argv.includes('--no-open')) {
             const { exec } = require('child_process');
-            exec(`start "" "${baseUrl}/configure"`, () => {});
+            const url = `${baseUrl}/configure`;
+            const cmd = process.platform === 'win32'
+                ? `start "" "${url}"`
+                : process.platform === 'darwin'
+                    ? `open "${url}"`
+                    : `xdg-open "${url}"`;
+            exec(cmd, () => {});   // 打不开也无所谓，地址已经打印在上面了
         }
     }
 });

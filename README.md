@@ -20,7 +20,9 @@ Stremio 播放影视
 
 ## 快速开始
 
-### 方式一：绿色版 exe（不用装 Node.js）
+### 方式一：绿色版可执行文件（不用装 Node.js）
+
+#### Windows
 
 直接双击 `stremio-ai-subtitles.exe`，浏览器会自动打开配置页，装进 Stremio 即可。
 程序自带 Node 运行时，整个文件夹拷走就能用。配套文件：
@@ -33,15 +35,35 @@ Stremio 播放影视
 | `.env` | 配置，必须和 exe 放在同一目录 |
 | `使用说明.txt` | 给最终用户看的说明 |
 
-自己从源码打包：
+#### macOS
+
+macOS 强制要求代码签名，未签名的可执行文件会被内核直接杀掉，所以**不能直接双击二进制**，
+要双击 `mac-启动.command`——它会自动 `chmod +x`、解除下载隔离、做 ad-hoc 签名后再启动。
+
+| 文件 | 用途 |
+|---|---|
+| `mac-启动.command` | 双击启动（自动处理权限与签名） |
+| `stremio-ai-subtitles-macos-arm64` | Apple 芯片（M1 及以上） |
+| `stremio-ai-subtitles-macos-x64` | Intel 芯片 |
+| `com.stremio.ai-subtitles.plist` | 开机自启用的 launchd 配置 |
+| `mac-使用说明.txt` | 详细步骤，含"模型地址不能盲抄 127.0.0.1"的说明 |
+
+#### 自己打包
 
 ```bash
 npm install
-npm run build:exe        # 产出 dist/stremio-ai-subtitles.exe
+npm run build:exe          # Windows: dist/stremio-ai-subtitles.exe
+
+# macOS 版本（建议在 Mac 上执行，pkg 会自动做 ad-hoc 签名）
+npx pkg index.js --targets node18-macos-arm64 --output dist/stremio-ai-subtitles-macos-arm64 --compress GZip
 ```
 
-打包用的是 [pkg](https://github.com/vercel/pkg)，目标 `node18-win-x64`。产物约 40MB，
-首次运行会被杀毒软件扫描一会儿属正常现象。
+打包用的是 [pkg](https://github.com/vercel/pkg)。Windows 产物约 40MB，macOS 约 50MB，
+首次运行会被系统扫描一会儿属正常现象。
+
+> 在 Windows 上交叉打包 macOS 版本需要加 `--no-bytecode --public-packages "*" --public`
+> （pkg 生成字节码时要执行目标平台的 node 二进制，跨平台跑不了），
+> 而且产物没有签名，必须在 Mac 上补一次 `codesign --force --sign - <文件>`。
 
 ### 方式二：从源码运行
 
