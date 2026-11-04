@@ -225,7 +225,7 @@ const LANG_MAP = {
 
 const manifest = {
     id: 'org.ai-translator.subtitles',
-    version: '1.0.0',
+    version: '1.1.0',
     name: 'AI 字幕翻译',
     description: '使用大模型自动翻译字幕为中文，让没有中文字幕的影视也能看懂',
     logo: 'https://fonts.gstatic.com/s/i/materialicons/translate/v16/translate_24px.svg',
