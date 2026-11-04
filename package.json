@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "node index.js --dev"
+    "dev": "node index.js --dev",
+    "test": "node --test test/unit.test.js test/e2e.test.js"
   },
   "keywords": [
     "stremio",
@@ -19,6 +20,9 @@
   ],
   "author": "",
   "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "stremio-addon-sdk": "^1.6.2",
     "axios": "^1.7.2",

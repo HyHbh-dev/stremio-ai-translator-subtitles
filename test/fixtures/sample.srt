@@ -1,0 +1,12 @@
+1
+00:00:01,000 --> 00:00:03,000
+Hello there.
+
+2
+00:00:03,500 --> 00:00:06,000
+-What was your response?
+-I told her I would not grant one.
+
+3
+00:00:06,500 --> 00:00:09,000
+<i>It was very bitter.</i>
