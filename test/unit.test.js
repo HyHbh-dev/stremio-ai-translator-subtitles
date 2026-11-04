@@ -238,3 +238,146 @@ test('buildManifest 为不同配置生成不同的 addon', () => {
     assert.ok(a.name.includes('Index-Translate-9B'));
     assert.strictEqual(a.behaviorHints.configurable, true);
 });
+
+// ============================================
+// 旧版接口（免 Key 通道）
+// ============================================
+
+const { startFakeLegacy } = require('./helpers/fake-servers');
+const { searchSubtitlesLegacy, downloadSubtitleLegacy, _resetTokenCache } = require('../src/legacyFetcher');
+const { fetchFromLegacy, fetchFromCdn, fetchBestSubtitle } = require('../src/subtitleFetcher');
+
+test('旧接口：登录 + 搜索 + gzip 下载能走通', async () => {
+    const legacy = await startFakeLegacy();
+    _resetTokenCache();
+
+    const cfg = {
+        opensubtitlesLegacyUrl: legacy.url,
+        opensubtitlesUserAgent: 'test-agent',
+        sourceLang: 'en',
+    };
+
+    try {
+        const list = await searchSubtitlesLegacy('tt0111161', 'en', cfg, {});
+        assert.strictEqual(list.length, 2);
+        assert.strictEqual(list[0].fileName, 'legacy-hi.srt');
+        assert.strictEqual(list[0].hearingImpaired, true);
+        assert.strictEqual(list[1].hearingImpaired, false);
+        assert.ok(legacy.calls.includes('LogIn'), '应先登录拿 token');
+
+        // gzip 解压后应拿到可解析的 SRT
+        const content = await downloadSubtitleLegacy(list[1].downloadLink, cfg);
+        assert.ok(content.includes('-->'), '下载内容应是解压后的 SRT');
+    } finally {
+        legacy.server.close();
+    }
+});
+
+test('旧接口：优先选非听障字幕并解析出条目', async () => {
+    const legacy = await startFakeLegacy();
+    _resetTokenCache();
+
+    const cfg = {
+        opensubtitlesLegacyUrl: legacy.url,
+        opensubtitlesUserAgent: 'test-agent',
+        sourceLang: 'en',
+    };
+
+    try {
+        const result = await fetchFromLegacy('tt0111161', cfg, {});
+        assert.ok(result, '应取到字幕');
+        assert.strictEqual(result.subtitleInfo.fileName, 'legacy-clean.srt');
+        assert.ok(result.entries.length > 0);
+    } finally {
+        legacy.server.close();
+    }
+});
+
+test('auto 模式：新版接口不可用时回退旧接口（有账号）', async () => {
+    const legacy = await startFakeLegacy();
+    _resetTokenCache();
+
+    const cfg = {
+        opensubtitlesLegacyUrl: legacy.url,
+        opensubtitlesBaseUrl: 'http://127.0.0.1:9/api/v1', // 必然连不上
+        opensubtitlesApiKey: '',
+        opensubtitlesUsername: 'demo-user',
+        opensubtitlesPassword: 'demo-pass',
+        opensubtitlesUserAgent: 'test-agent',
+        sourceLang: 'en',
+        subtitleSource: 'auto',
+    };
+
+    try {
+        const result = await fetchBestSubtitle('tt0111161', cfg, {});
+        assert.ok(result, '旧接口应兜底成功');
+        assert.strictEqual(result.source, 'legacy');
+    } finally {
+        legacy.server.close();
+    }
+});
+
+test('subtitleSource 只接受 auto / rest / legacy', () => {
+    assert.strictEqual(sanitizeConfig({ subtitleSource: 'legacy' }).subtitleSource, 'legacy');
+    assert.strictEqual(sanitizeConfig({ subtitleSource: 'AUTO' }).subtitleSource, 'auto');
+    assert.strictEqual(sanitizeConfig({ subtitleSource: 'ftp' }).subtitleSource, undefined);
+});
+
+// ============================================
+// 占位字幕识别 & 官方 CDN 通道
+// ============================================
+
+const { isPromoPlaceholder } = require('../src/legacyFetcher');
+const {
+    normalizeLang,
+    searchSubtitlesViaCdn,
+    downloadSubtitleViaCdn,
+} = require('../src/stremioCdnFetcher');
+const { startFakeCdn } = require('./helpers/fake-servers');
+
+test('能识别「开通 VIP」占位字幕', () => {
+    const promo = '1\n00:00:00,001 --> 04:00:00,002\nBecome OpenSubtitles.org VIP member \nto get subtitles -> osdb.link/vip';
+    assert.strictEqual(isPromoPlaceholder(promo), true);
+
+    const normal = '1\n00:00:01,000 --> 00:00:02,000\nHello there';
+    assert.strictEqual(isPromoPlaceholder(normal), false);
+
+    // 大文件即使含关键字也不当成占位
+    assert.strictEqual(isPromoPlaceholder('osdb.link ' + 'x'.repeat(1000)), false);
+});
+
+test('语言码归一化：eng -> en', () => {
+    assert.strictEqual(normalizeLang('eng'), 'en');
+    assert.strictEqual(normalizeLang('zho'), 'zh');
+    assert.strictEqual(normalizeLang('EN'), 'en');
+});
+
+test('官方 CDN：按语言过滤并解析出条目', async () => {
+    const cdn = await startFakeCdn();
+    const cfg = { stremioCdnUrl: cdn.url, sourceLang: 'en' };
+
+    try {
+        const list = await searchSubtitlesViaCdn('tt0111161', 'en', cfg, {});
+        assert.strictEqual(list.length, 2, '西班牙语字幕应被过滤掉');
+        assert.ok(list.every((s) => s.language === 'eng'));
+
+        const content = await downloadSubtitleViaCdn(list[0].downloadLink, cfg);
+        assert.ok(content.includes('-->'));
+    } finally {
+        cdn.server.close();
+    }
+});
+
+test('官方 CDN：优先选非听障字幕', async () => {
+    const cdn = await startFakeCdn();
+    const cfg = { stremioCdnUrl: cdn.url, sourceLang: 'en' };
+
+    try {
+        const result = await fetchFromCdn('tt0111161', cfg, {});
+        assert.ok(result, '应取到字幕');
+        assert.strictEqual(result.subtitleInfo.fileName, 'movie.2020.1080p.srt');
+        assert.ok(result.entries.length > 0);
+    } finally {
+        cdn.server.close();
+    }
+});

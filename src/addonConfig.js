@@ -18,7 +18,13 @@ const URL_CONFIG_FIELDS = [
     'targetLang',
     'sourceLang',
     'translateBatchSize',
+    'subtitleSource',
+    'opensubtitlesUsername',
+    'opensubtitlesPassword',
 ];
+
+// 字幕源可选值
+const SUBTITLE_SOURCES = ['auto', 'rest', 'legacy', 'cdn'];
 
 /**
  * 校验并规范化单个字段
@@ -45,9 +51,16 @@ function sanitizeField(key, value) {
         return str.toLowerCase();
     }
 
+    if (key === 'subtitleSource') {
+        const v = str.toLowerCase();
+        return SUBTITLE_SOURCES.includes(v) ? v : undefined;
+    }
+
     if (key === 'llmModel') return str.slice(0, 200);
     if (key === 'llmApiKey') return str.replace(/\s+/g, '').slice(0, 300);
     if (key === 'opensubtitlesApiKey') return str.replace(/\s+/g, '').slice(0, 300);
+    if (key === 'opensubtitlesUsername') return str.slice(0, 120);
+    if (key === 'opensubtitlesPassword') return str.slice(0, 120);
 
     return str.slice(0, 300);
 }
@@ -110,6 +123,8 @@ function configHash(cfg) {
         cfg.llmApiKey ? 'has-llm-key' : 'no-llm-key',
         cfg.targetLang || '',
         cfg.sourceLang || '',
+        cfg.subtitleSource || '',
+        cfg.opensubtitlesUsername ? 'has-os-user' : 'no-os-user',
         String(cfg.translateBatchSize || ''),
     ].join('|');
     return crypto.createHash('sha1').update(basis).digest('hex');
@@ -132,6 +147,7 @@ function buildManifest(baseManifest, cfg) {
 
 module.exports = {
     URL_CONFIG_FIELDS,
+    SUBTITLE_SOURCES,
     sanitizeConfig,
     encodeConfig,
     decodeConfig,

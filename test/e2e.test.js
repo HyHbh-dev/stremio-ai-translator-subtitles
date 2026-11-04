@@ -8,7 +8,7 @@ const assert = require('node:assert');
 const { spawn } = require('child_process');
 const path = require('path');
 
-const { startFakeOpenSubtitles, startFakeLLM } = require('./helpers/fake-servers');
+const { startFakeOpenSubtitles, startFakeLegacy, startFakeCdn, startFakeLLM } = require('./helpers/fake-servers');
 const { encodeConfig } = require('../src/addonConfig');
 
 const ROOT = path.join(__dirname, '..');
@@ -35,6 +35,8 @@ async function startAddon(env) {
             TARGET_LANG: 'zh',
             SOURCE_LANG: 'en',
             OPENSUBTITLES_API_KEY: 'test-key',
+            // 默认只测新版接口，避免用例偷偷打外网；旧接口行为由专门的用例覆盖
+            SUBTITLE_SOURCE: 'rest',
             TRANSLATE_BATCH_SIZE: '30',
             ...env,
         },
@@ -202,29 +204,41 @@ test('翻译全部失败时不返回伪装成中文的字幕', async (t) => {
     assert.deepStrictEqual(subtitles, [], '翻译全失败时不应返回字幕条目');
 });
 
-test('未配置 OpenSubtitles Key 时启动只告警，安装链接里的配置优先生效', async (t) => {
+test('没配 Key 和账号时自动落到官方 CDN，安装链接里的配置优先生效', async (t) => {
     const openSubs = await startFakeOpenSubtitles();
+    const legacy = await startFakeLegacy();
+    const cdn = await startFakeCdn();
     const llm = await startFakeLLM();
 
-    // 服务端完全不带 Key，模拟"装到 Stremio 里再填"
+    // 服务端完全不带 Key / 账号，模拟"开箱即用"
     const { child, base, getOutput } = await startAddon({
         OPENSUBTITLES_BASE_URL: openSubs.url,
+        OPENSUBTITLES_LEGACY_URL: legacy.url,
+        STREMIO_CDN_URL: cdn.url,
+        SUBTITLE_SOURCE: 'auto',
         LLM_BASE_URL: llm.url,
         OPENSUBTITLES_API_KEY: '',
+        OPENSUBTITLES_USERNAME: '',
+        OPENSUBTITLES_PASSWORD: '',
     });
 
     t.after(async () => {
         await stop(child);
         openSubs.server.close();
+        legacy.server.close();
+        cdn.server.close();
         llm.server.close();
     });
 
-    // 没有配置时应返回空列表，而不是崩掉
+    // 没有 Key 也不该崩：auto 模式回退到免 Key 的官方 CDN
     const plain = await (await fetch(`${base}/subtitles/movie/tt0111161.json`)).json();
-    assert.deepStrictEqual(plain.subtitles, []);
+    assert.strictEqual(plain.subtitles.length, 1, '没有 Key 时应由官方 CDN 兜底');
     assert.ok(getOutput().includes('未配置 OPENSUBTITLES_API_KEY'), getOutput());
+    assert.ok(getOutput().includes('CDN'), '日志里应能看到走了 CDN 通道');
+    // 没账号时不该去打旧接口（匿名只会拿到占位字幕）
+    assert.strictEqual(legacy.calls.length, 0, '没账号时应跳过旧接口');
 
-    // 通过安装链接传入 Key 后即可正常出字幕
+    // 通过安装链接传入 Key 后改走新版接口
     const token = encodeConfig({ opensubtitlesApiKey: 'key-from-stremio', translateBatchSize: 20 });
     const res = await fetch(`${base}/c/${token}/subtitles/movie/tt0111161.json`);
     assert.strictEqual(res.status, 200);
@@ -261,6 +275,11 @@ test('配置页与带配置的 manifest', async (t) => {
     const html = await page.text();
     assert.ok(html.includes('OpenSubtitles API Key'));
     assert.ok(html.includes('生成安装链接'));
+    // 字幕源选择 + 两个测试按钮
+    assert.ok(html.includes('id="subtitleSource"'), '应有字幕源选择');
+    assert.ok(html.includes('id="btnTest"'), '应有测试连接按钮');
+    assert.ok(html.includes('id="btnSample"'), '应有试翻按钮');
+    assert.ok(html.includes('/api/test-translate'), '试翻按钮应调用后端接口');
 
     // 带配置的 manifest：id 与名称随配置变化
     const tokenA = encodeConfig({ llmModel: 'model-a', opensubtitlesApiKey: 'k' });

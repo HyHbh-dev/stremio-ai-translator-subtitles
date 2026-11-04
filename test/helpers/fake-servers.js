@@ -6,8 +6,101 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 
 const FIXTURE_SRT = fs.readFileSync(path.join(__dirname, '..', 'fixtures', 'sample.srt'), 'utf8');
+
+/**
+ * 构造一条 SearchSubtitles 结果的 XML struct
+ */
+function legacyEntry(fields) {
+    const members = Object.entries(fields)
+        .map(([k, v]) => `<member><name>${k}</name><value><string>${v}</string></value></member>`)
+        .join('');
+    return `<value><struct>${members}</struct></value>`;
+}
+
+/**
+ * 启动一个假的旧版 XML-RPC 接口
+ * - LogIn            返回固定 token
+ * - SearchSubtitles  返回两条候选（含一条听障版，下载量更高）
+ * - GET /files/x.gz  返回 gzip 压缩的 SRT
+ */
+function startFakeLegacy(port = 0) {
+    const calls = [];
+
+    const server = http.createServer((req, res) => {
+        if (req.method === 'POST' && req.url === '/xml-rpc') {
+            let body = '';
+            req.on('data', (c) => (body += c));
+            req.on('end', () => {
+                const method = (body.match(/<methodName>([^<]+)</) || [])[1] || '';
+                calls.push(method);
+
+                if (method === 'LogIn') {
+                    res.writeHead(200, { 'Content-Type': 'text/xml; charset=utf-8' });
+                    res.end('<?xml version="1.0" encoding="utf-8"?><methodResponse><params><param><value><struct>'
+                        + '<member><name>token</name><value><string>fake-token</string></value></member>'
+                        + '<member><name>status</name><value><string>200 OK</string></value></member>'
+                        + '</struct></value></param></params></methodResponse>');
+                    return;
+                }
+
+                if (method === 'SearchSubtitles') {
+                    const base = `http://127.0.0.1:${server.address().port}`;
+                    const data = [
+                        legacyEntry({
+                            IDSubtitleFile: '1001',
+                            SubFileName: 'legacy-hi.srt',
+                            SubFormat: 'srt',
+                            SubLanguageID: 'eng',
+                            SubDownloadsCnt: '5000',
+                            SubHearingImpaired: '1',
+                            SubDownloadLink: `${base}/files/1001.gz`,
+                        }),
+                        legacyEntry({
+                            IDSubtitleFile: '1002',
+                            SubFileName: 'legacy-clean.srt',
+                            SubFormat: 'srt',
+                            SubLanguageID: 'eng',
+                            SubDownloadsCnt: '80',
+                            SubHearingImpaired: '0',
+                            SubDownloadLink: `${base}/files/1002.gz`,
+                        }),
+                    ].join('');
+
+                    res.writeHead(200, { 'Content-Type': 'text/xml; charset=utf-8' });
+                    res.end('<?xml version="1.0" encoding="utf-8"?><methodResponse><params><param><value><struct>'
+                        + `<member><name>data</name><value><array><data>${data}</data></array></value></member>`
+                        + '<member><name>status</name><value><string>200 OK</string></value></member>'
+                        + '</struct></value></param></params></methodResponse>');
+                    return;
+                }
+
+                res.writeHead(200, { 'Content-Type': 'text/xml; charset=utf-8' });
+                res.end('<?xml version="1.0"?><methodResponse><params><param><value><struct>'
+                    + '<member><name>status</name><value><string>200 OK</string></value></member>'
+                    + '</struct></value></param></params></methodResponse>');
+            });
+            return;
+        }
+
+        if (req.method === 'GET' && req.url.startsWith('/files/')) {
+            res.writeHead(200, { 'Content-Type': 'application/gzip' });
+            res.end(zlib.gzipSync(Buffer.from(FIXTURE_SRT, 'utf8')));
+            return;
+        }
+
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not Found' }));
+    });
+
+    return new Promise((resolve) => {
+        server.listen(port, '127.0.0.1', () => {
+            resolve({ server, port: server.address().port, url: `http://127.0.0.1:${server.address().port}/xml-rpc`, calls });
+        });
+    });
+}
 
 /**
  * 启动一个假 OpenSubtitles 服务
@@ -161,4 +254,60 @@ function translatePrompt(prompt) {
     return out.join('\n');
 }
 
-module.exports = { startFakeOpenSubtitles, startFakeLLM };
+/**
+ * 启动一个假的 Stremio 官方字幕插件 CDN
+ * - GET /subtitles/movie/tt...json  返回 v3 格式的字幕列表
+ * - GET /files/x.srt                返回明文 SRT
+ */
+function startFakeCdn(port = 0) {
+    const server = http.createServer((req, res) => {
+        const reqUrl = new URL(req.url, 'http://127.0.0.1');
+        const base = `http://127.0.0.1:${server.address().port}`;
+
+        if (req.method === 'GET' && reqUrl.pathname.startsWith('/subtitles/')) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                subtitles: [
+                    {
+                        id: '9001',
+                        // 听障版：文件名带 .HI.，应被降权
+                        url: `${base}/files/9001.srt`,
+                        lang: 'eng',
+                        subtitleFileName: 'movie.2020.1080p.HI.srt',
+                    },
+                    {
+                        id: '9002',
+                        url: `${base}/files/9002.srt`,
+                        lang: 'eng',
+                        subtitleFileName: 'movie.2020.1080p.srt',
+                    },
+                    {
+                        // 其他语言，应被过滤掉
+                        id: '9003',
+                        url: `${base}/files/9003.srt`,
+                        lang: 'spa',
+                        subtitleFileName: 'movie.2020.1080p.spa.srt',
+                    },
+                ],
+            }));
+            return;
+        }
+
+        if (req.method === 'GET' && reqUrl.pathname.startsWith('/files/')) {
+            res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end(FIXTURE_SRT);
+            return;
+        }
+
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not Found' }));
+    });
+
+    return new Promise((resolve) => {
+        server.listen(port, '127.0.0.1', () => {
+            resolve({ server, port: server.address().port, url: `http://127.0.0.1:${server.address().port}` });
+        });
+    });
+}
+
+module.exports = { startFakeOpenSubtitles, startFakeLegacy, startFakeCdn, startFakeLLM };

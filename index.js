@@ -24,10 +24,12 @@ const axios = require('axios');
 const { AsyncLocalStorage } = require('async_hooks');
 
 const { fetchBestSubtitle, entriesToVTT } = require('./src/subtitleFetcher');
-const { translateWithCache, cacheSize } = require('./src/translator');
+const { translateWithCache, translateBatch, cacheSize } = require('./src/translator');
 const { parseMediaId } = require('./src/mediaId');
 const { decodeConfig, mergeConfig, configHash, buildManifest } = require('./src/addonConfig');
 const { renderConfigurePage } = require('./src/configurePage');
+const { probeLegacy } = require('./src/legacyFetcher');
+const { probeCdn } = require('./src/stremioCdnFetcher');
 
 // 加载环境变量
 dotenv.config();
@@ -42,18 +44,24 @@ const config = {
     sourceLang: process.env.SOURCE_LANG || 'en',
     opensubtitlesApiKey: process.env.OPENSUBTITLES_API_KEY || '',
     opensubtitlesBaseUrl: process.env.OPENSUBTITLES_BASE_URL || 'https://api.opensubtitles.com/api/v1',
+    opensubtitlesLegacyUrl: process.env.OPENSUBTITLES_LEGACY_URL || 'https://api.opensubtitles.org/xml-rpc',
+    opensubtitlesUsername: process.env.OPENSUBTITLES_USERNAME || '',
+    opensubtitlesPassword: process.env.OPENSUBTITLES_PASSWORD || '',
+    stremioCdnUrl: process.env.STREMIO_CDN_URL || 'https://opensubtitles-v3.strem.io',
     opensubtitlesUserAgent: process.env.OPENSUBTITLES_USER_AGENT || 'StremioAITranslator v1.0',
+    // 字幕源：auto = 新版 → 旧版 → 官方 CDN 依次尝试；rest / legacy / cdn = 只用指定通道
+    subtitleSource: process.env.SUBTITLE_SOURCE || 'auto',
     translateBatchSize: parseInt(process.env.TRANSLATE_BATCH_SIZE || '30', 10),
     cacheTtlHours: parseInt(process.env.CACHE_TTL_HOURS || '24', 10),
     // 反向代理 / 远程部署时，用于生成对外可访问的字幕地址
     publicUrl: (process.env.PUBLIC_URL || '').replace(/\/+$/, ''),
 };
 
-// 缺少 OpenSubtitles Key 时不再直接退出——用户可以在 /configure 页面里填写
-if (!config.opensubtitlesApiKey) {
-    console.warn('\n[警告] 未配置 OPENSUBTITLES_API_KEY。');
-    console.warn('       打开 http://localhost:' + config.port + '/configure 填写后安装；');
-    console.warn('       或在 .env 中配置后重启。\n');
+// 只有强制走新版接口时才必须配 Key；旧接口不需要 Key
+if (!config.opensubtitlesApiKey && config.subtitleSource !== 'legacy') {
+    console.warn('\n[提示] 未配置 OPENSUBTITLES_API_KEY。');
+    console.warn('       默认会用免 Key 的旧接口抓字幕；如想用新版接口，');
+    console.warn('       打开 http://localhost:' + config.port + '/configure 填写后安装。\n');
 }
 
 // ============================================
@@ -169,8 +177,8 @@ builder.defineSubtitlesHandler(async ({ id, type }) => {
             return { subtitles: [] };
         }
 
-        if (!cfg.opensubtitlesApiKey) {
-            console.error('[subtitlesHandler] 未配置 OpenSubtitles API Key，请在 /configure 页面填写');
+        if (!cfg.opensubtitlesApiKey && (cfg.subtitleSource === 'rest')) {
+            console.error('[subtitlesHandler] 字幕源设为「仅新版接口」但未配置 Api-Key');
             return { subtitles: [] };
         }
 
@@ -337,6 +345,79 @@ async function testOpenSubtitles(cfg) {
     }
 }
 
+/**
+ * 检查旧版接口是否可用（免 Key，只查询不下载）
+ */
+async function testOpenSubtitlesLegacy(cfg) {
+    try {
+        const count = await probeLegacy(cfg);
+        if (!count) {
+            return { ok: true, message: '接口可访问，但示例影片没查到字幕' };
+        }
+        return { ok: true, message: `免 Key 可用（示例查询到 ${count} 条）` };
+    } catch (error) {
+        return { ok: false, message: `请求失败（${error.message}）` };
+    }
+}
+
+/**
+ * 检查 Stremio 官方插件 CDN 是否可用（免 Key）
+ */
+async function testStremioCdn(cfg) {
+    try {
+        const count = await probeCdn(cfg);
+        if (!count) {
+            return { ok: true, message: '接口可访问，但示例影片没查到英文字幕' };
+        }
+        return { ok: true, message: `免 Key 可用（示例查询到 ${count} 条英文字幕）` };
+    } catch (error) {
+        return { ok: false, message: `请求失败（${error.message}）` };
+    }
+}
+
+/**
+ * 端到端试翻：真取一次字幕、真调一次模型，只翻前几条
+ * 会消耗一次字幕下载配额，所以单独做成按钮，不混进"测试连接"
+ */
+async function testTranslateSample(cfg, imdbId) {
+    const started = Date.now();
+    const id = /^tt\d+$/.test(imdbId || '') ? imdbId : 'tt0111161';
+
+    try {
+        const data = await fetchBestSubtitle(id, cfg, {});
+        if (!data) {
+            return { ok: false, message: '没取到源字幕，检查网络或更换字幕源' };
+        }
+
+        const sample = data.entries.filter((e) => String(e.text || '').trim()).slice(0, 3);
+        if (sample.length === 0) {
+            return { ok: false, message: '字幕解析结果为空' };
+        }
+
+        const { results, matched } = await translateBatch(sample, cfg);
+        if (!matched) {
+            return { ok: false, message: '模型没有按序号返回译文，换模型或降低批次条数试试' };
+        }
+
+        const pairs = sample.map((entry, i) => ({
+            source: entry.text,
+            target: (results.find((r) => r.index === entry.index) || results[i] || {}).text || '',
+        }));
+
+        const SOURCE_LABEL = { rest: '新版接口', legacy: '旧接口', cdn: '官方 CDN' };
+        return {
+            ok: true,
+            message: `${SOURCE_LABEL[data.source] || data.source}取到 ${data.entries.length} 条，试翻 ${matched}/${sample.length} 条，耗时 ${((Date.now() - started) / 1000).toFixed(1)}s`,
+            source: data.source,
+            sourceLabel: SOURCE_LABEL[data.source] || data.source,
+            sampleFile: data.subtitleInfo && data.subtitleInfo.fileName,
+            pairs,
+        };
+    } catch (error) {
+        return { ok: false, message: `试翻失败（${error.message}）` };
+    }
+}
+
 function readJsonBody(req, limit = 16 * 1024) {
     return new Promise((resolve) => {
         let body = '';
@@ -404,9 +485,28 @@ const server = http.createServer(async (req, res) => {
         if (body.llmApiKey) cfg.llmApiKey = body.llmApiKey;
         if (body.opensubtitlesApiKey) cfg.opensubtitlesApiKey = body.opensubtitlesApiKey;
 
-        const [llm, opensubtitles] = await Promise.all([testLLM(cfg), testOpenSubtitles(cfg)]);
+        const [llm, opensubtitles, legacy, cdn] = await Promise.all([
+            testLLM(cfg),
+            testOpenSubtitles(cfg),
+            testOpenSubtitlesLegacy(cfg),
+            testStremioCdn(cfg),
+        ]);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ llm, opensubtitles }));
+        res.end(JSON.stringify({ llm, opensubtitles, legacy, cdn }));
+        return;
+    }
+
+    // 端到端试翻（会真实下载 1 条字幕 + 调用模型）
+    if (path === '/api/test-translate' && req.method === 'POST') {
+        const body = await readJsonBody(req);
+        const cfg = mergeConfig(config, body);
+        if (body.llmBaseUrl) cfg.llmBaseUrl = body.llmBaseUrl;
+        if (body.llmApiKey) cfg.llmApiKey = body.llmApiKey;
+        if (body.opensubtitlesApiKey) cfg.opensubtitlesApiKey = body.opensubtitlesApiKey;
+
+        const result = await testTranslateSample(cfg, body.imdbId);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
         return;
     }
 
@@ -516,7 +616,7 @@ server.listen(config.port, () => {
     console.log(`  大模型:      ${config.llmModel}`);
     console.log(`  翻译方向:    ${config.sourceLang} → ${config.targetLang}`);
     console.log(`  批次大小:    ${config.translateBatchSize} 条/批`);
-    console.log(`  字幕来源:    ${config.opensubtitlesBaseUrl}`);
+    console.log(`  字幕源:      ${config.subtitleSource}${config.subtitleSource === 'auto' ? '（新版优先，失败回退旧接口）' : ''}`);
     console.log('========================================');
     console.log('\n安装方式（推荐）：');
     console.log(`  1. 打开 ${baseUrl}/configure 填写模型地址与 OpenSubtitles Key`);

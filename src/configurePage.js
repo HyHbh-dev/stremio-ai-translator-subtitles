@@ -18,6 +18,15 @@ function renderConfigurePage({ defaults, origin, serverHasKeys }) {
         .map(([code, label]) => `<option value="${code}"${code === current ? ' selected' : ''}>${label}</option>`)
         .join('');
 
+    const sourceOptions = (current) => [
+        ['auto', '自动（新版 → 旧版 → 官方 CDN 依次尝试）'],
+        ['cdn', 'Stremio 官方 CDN（免 Key，不限次数）'],
+        ['rest', '新版 REST（必须填 Key）'],
+        ['legacy', '旧接口 XML-RPC（免 Key，下载需账号）'],
+    ]
+        .map(([code, label]) => `<option value="${code}"${code === (current || 'auto') ? ' selected' : ''}>${label}</option>`)
+        .join('');
+
     return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -76,6 +85,11 @@ function renderConfigurePage({ defaults, origin, serverHasKeys }) {
   .status div:first-child { border-top: 0; }
   .ok { color: var(--ok); font-weight: 600; }
   .bad { color: var(--bad); font-weight: 600; }
+  .sample { display: none; margin-top: 14px; }
+  .sample.show { display: block; }
+  .pair { border: 1px solid #e3e6eb; border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; background: #fafbfc; }
+  .pair .src { color: var(--muted); font-size: 12px; }
+  .pair .dst { font-size: 13px; margin-top: 2px; }
   ol { padding-left: 20px; margin: 8px 0 0; color: #3a4048; font-size: 13px; }
   ol li { margin-bottom: 4px; }
   @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
@@ -102,8 +116,21 @@ function renderConfigurePage({ defaults, origin, serverHasKeys }) {
       <input id="llmApiKey" type="password" autocomplete="off" placeholder="sk-..." />
     </div>
     <div class="row">
-      <label>OpenSubtitles API Key <span class="hint">${serverHasKeys.opensubtitles ? '服务端已配置，可留空' : '必填'}</span></label>
+      <label>字幕源 <span class="hint">官方 CDN 是免 Key 无限次的兜底；旧接口匿名下载只会拿到 VIP 占位字幕</span></label>
+      <select id="subtitleSource">
+        ${sourceOptions(defaults.subtitleSource)}
+      </select>
+    </div>
+    <div class="row">
+      <label>OpenSubtitles API Key <span class="hint">${serverHasKeys.opensubtitles ? '服务端已配置，可留空' : '选「官方 CDN」或「旧接口」时可留空'}</span></label>
       <input id="opensubtitlesApiKey" type="password" autocomplete="off" placeholder="在 opensubtitles.com/consumers 申请" />
+    </div>
+    <div class="row">
+      <label>OpenSubtitles 账号 <span class="hint">可选，只有用旧接口下载时才需要</span></label>
+      <div class="grid">
+        <input id="opensubtitlesUsername" autocomplete="off" placeholder="用户名" />
+        <input id="opensubtitlesPassword" type="password" autocomplete="off" placeholder="密码" />
+      </div>
     </div>
     <div class="grid">
       <div class="row">
@@ -127,9 +154,14 @@ function renderConfigurePage({ defaults, origin, serverHasKeys }) {
     <div class="actions">
       <button id="btnBuild">生成安装链接</button>
       <button id="btnTest" class="secondary">测试连接</button>
+      <button id="btnSample" class="secondary">试翻 3 条</button>
     </div>
 
     <div id="status" class="status"></div>
+
+    <div id="sampleBox" class="sample"></div>
+
+    <div class="note">「测试连接」只查询不下载，不消耗任何字幕配额；「试翻 3 条」会真实下载 1 条字幕并调用模型，用于确认整条链路通不通。</div>
 
     <div id="out" class="out">
       <div class="row" style="margin-top:16px">
@@ -137,7 +169,7 @@ function renderConfigurePage({ defaults, origin, serverHasKeys }) {
         <code class="url" id="url"></code>
         <a id="installLink" class="install" href="#">在 Stremio 中安装</a>
       </div>
-      <div class="warn">这个链接里包含你的 API Key，请勿公开分享。</div>
+      <div class="warn">这个链接里包含你的 API Key / 账号密码，请勿公开分享。</div>
       <div class="note">按钮没反应时，把上面的链接复制到 Stremio「插件」页的地址栏，按回车即可安装。</div>
     </div>
   </div>
@@ -145,8 +177,9 @@ function renderConfigurePage({ defaults, origin, serverHasKeys }) {
   <div class="card">
     <label style="margin-bottom:8px">安装步骤</label>
     <ol>
-      <li>填好模型地址、模型名称和 OpenSubtitles Key。</li>
-      <li>点「测试连接」，确认大模型和 OpenSubtitles 都能通。</li>
+      <li>填好模型地址、模型名称，选择字幕源（想省配额就选「旧接口」，不用填 Key）。</li>
+      <li>点「测试连接」，确认大模型和两条字幕通道的状态。</li>
+      <li>点「试翻 3 条」，看到中英对照就说明整条链路通了。</li>
       <li>点「生成安装链接」，再点「在 Stremio 中安装」。</li>
       <li>播放任意没有中文字幕的影视，字幕列表里会出现「AI翻译中文字幕」。</li>
     </ol>
@@ -158,12 +191,21 @@ function renderConfigurePage({ defaults, origin, serverHasKeys }) {
 
   const $ = (id) => document.getElementById(id);
 
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;',
+    }[c]));
+  }
+
   function collect() {
     const cfg = {
       llmBaseUrl: $('llmBaseUrl').value.trim(),
       llmModel: $('llmModel').value.trim(),
       llmApiKey: $('llmApiKey').value.trim(),
       opensubtitlesApiKey: $('opensubtitlesApiKey').value.trim(),
+      opensubtitlesUsername: $('opensubtitlesUsername').value.trim(),
+      opensubtitlesPassword: $('opensubtitlesPassword').value.trim(),
+      subtitleSource: $('subtitleSource').value,
       sourceLang: $('sourceLang').value,
       targetLang: $('targetLang').value,
       translateBatchSize: parseInt($('translateBatchSize').value, 10) || 30,
@@ -194,6 +236,12 @@ function renderConfigurePage({ defaults, origin, serverHasKeys }) {
     $('out').classList.add('show');
   });
 
+  function line(name, r) {
+    const detail = r && r.message ? ' <span style="color:#6b7480">— ' + r.message + '</span>' : '';
+    const state = r && r.ok ? '<span class="ok">正常</span>' : '<span class="bad">失败</span>';
+    return '<div>' + name + '：' + state + detail + '</div>';
+  }
+
   $('btnTest').addEventListener('click', async () => {
     const btn = $('btnTest');
     const box = $('status');
@@ -206,10 +254,40 @@ function renderConfigurePage({ defaults, origin, serverHasKeys }) {
         body: JSON.stringify(collect()),
       });
       const data = await res.json();
-      const line = (name, r) =>
-        '<div>' + name + '：' + (r.ok ? '<span class="ok">正常</span>' : '<span class="bad">失败</span>')
-        + (r.message ? ' <span style="color:#6b7480">— ' + r.message + '</span>' : '') + '</div>';
-      box.innerHTML = line('大模型', data.llm || {}) + line('OpenSubtitles', data.opensubtitles || {});
+      box.innerHTML =
+        line('大模型', data.llm) +
+        line('新版接口 (REST)', data.opensubtitles) +
+        line('旧接口 (免 Key)', data.legacy) +
+        line('官方 CDN (免 Key)', data.cdn);
+    } catch (e) {
+      box.innerHTML = '<div><span class="bad">请求失败</span> — ' + e.message + '</div>';
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $('btnSample').addEventListener('click', async () => {
+    const btn = $('btnSample');
+    const box = $('status');
+    const sample = $('sampleBox');
+    btn.disabled = true;
+    sample.classList.remove('show');
+    box.innerHTML = '<div>正在取字幕并试翻 3 条，首次可能要几十秒…</div>';
+    try {
+      const res = await fetch('/api/test-translate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(collect()),
+      });
+      const data = await res.json();
+      box.innerHTML = line('端到端试翻', data);
+      if (data.pairs && data.pairs.length) {
+        sample.innerHTML = data.pairs
+          .map((p) => '<div class="pair"><div class="src">' + escapeHtml(p.source) + '</div>'
+            + '<div class="dst">' + escapeHtml(p.target) + '</div></div>')
+          .join('');
+        sample.classList.add('show');
+      }
     } catch (e) {
       box.innerHTML = '<div><span class="bad">请求失败</span> — ' + e.message + '</div>';
     } finally {

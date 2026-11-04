@@ -2,11 +2,19 @@
  * subtitleFetcher.js
  * 从 OpenSubtitles 获取字幕，并解析 SRT/VTT 格式
  *
- * 注意：OpenSubtitles REST API 的版本路径是 /api/v1（站内文档地址写的是 v2，但
- * /api/v2/* 会返回 HTML 404，不要用）。
+ * 三条通道：
+ *   - REST    https://api.opensubtitles.com/api/v1  需要 Api-Key，匿名每天 5 次下载
+ *     （站内文档地址写的是 v2，但 /api/v2/* 会返回 HTML 404，不要用）
+ *   - XML-RPC https://api.opensubtitles.org/xml-rpc  不需要 Key，但匿名下载只有 VIP 占位文件
+ *     Stremio 官方 OpenSubtitles v3 插件早期用的就是这条
+ *   - CDN     官方插件的公开接口，免 Key、无下载次数限制（借用第三方服务）
+ *
+ * 具体用哪条由 config.subtitleSource 控制，见 fetchBestSubtitle。
  */
 
 const axios = require('axios');
+const { searchSubtitlesLegacy, downloadSubtitleLegacy } = require('./legacyFetcher');
+const { searchSubtitlesViaCdn, downloadSubtitleViaCdn } = require('./stremioCdnFetcher');
 
 const DEFAULT_OPEN_SUBS_API = 'https://api.opensubtitles.com/api/v1';
 
@@ -329,39 +337,118 @@ function pickBestSubtitle(subtitles) {
 }
 
 /**
+ * 用新版 REST 接口取字幕（需要 Api-Key）
+ */
+async function fetchFromRest(imdbId, config, options) {
+    if (!config.opensubtitlesApiKey) {
+        console.log('[subtitleFetcher] 未配置 Api-Key，跳过新版接口');
+        return null;
+    }
+
+    const subtitles = await searchSubtitles(imdbId, config.sourceLang, config, options);
+    if (subtitles.length === 0) return null;
+
+    const best = pickBestSubtitle(subtitles);
+    console.log(`[subtitleFetcher] [REST] 找到 ${subtitles.length} 条，选择: ${best.fileName}`);
+
+    const content = await downloadSubtitle(best.fileId, config);
+    if (!content) return null;
+
+    const entries = parseSubtitle(content);
+    console.log(`[subtitleFetcher] [REST] 解析到 ${entries.length} 条字幕`);
+    return entries.length ? { content, format: best.format, entries, subtitleInfo: best } : null;
+}
+
+/**
+ * 用旧版 XML-RPC 接口取字幕（不需要 Api-Key，配额按 IP 计算且宽松）
+ */
+async function fetchFromLegacy(imdbId, config, options) {
+    const subtitles = await searchSubtitlesLegacy(imdbId, config.sourceLang, config, options);
+    if (subtitles.length === 0) return null;
+
+    const best = pickBestSubtitle(subtitles);
+    console.log(`[subtitleFetcher] [旧接口] 找到 ${subtitles.length} 条，选择: ${best.fileName}`);
+
+    const content = await downloadSubtitleLegacy(best.downloadLink, config);
+    if (!content) return null;
+
+    const entries = parseSubtitle(content);
+    console.log(`[subtitleFetcher] [旧接口] 解析到 ${entries.length} 条字幕`);
+    return entries.length ? { content, format: best.format, entries, subtitleInfo: best } : null;
+}
+
+/**
+ * 用 Stremio 官方插件的 CDN 取字幕（免 Key，无下载次数限制）
+ */
+async function fetchFromCdn(imdbId, config, options) {
+    const subtitles = await searchSubtitlesViaCdn(imdbId, config.sourceLang, config, options);
+    if (subtitles.length === 0) return null;
+
+    const best = pickBestSubtitle(subtitles);
+    console.log(`[subtitleFetcher] [CDN] 找到 ${subtitles.length} 条，选择: ${best.fileName}`);
+
+    const content = await downloadSubtitleViaCdn(best.downloadLink, config);
+    if (!content) return null;
+
+    const entries = parseSubtitle(content);
+    console.log(`[subtitleFetcher] [CDN] 解析到 ${entries.length} 条字幕`);
+    return entries.length ? { content, format: best.format, entries, subtitleInfo: best } : null;
+}
+
+/**
  * 获取最佳源字幕
+ *
+ * 字幕源由 config.subtitleSource 决定：
+ *   - rest   只用新版接口（需要 Api-Key）
+ *   - legacy 只用旧版接口（不需要 Key，但要账号才能下到真字幕）
+ *   - cdn    只用 Stremio 官方插件的 CDN（免 Key，无限次，借用第三方服务）
+ *   - auto   按下表依次尝试，任一成功即返回
+ *
  * @param {string} imdbId - IMDb ID
  * @param {object} config - 配置对象
  * @param {object} [options] - { season, episode } 剧集时需要
- * @returns {Promise<{content, format, entries, subtitleInfo}|null>}
+ * @returns {Promise<{content, format, entries, subtitleInfo, source}|null>}
  */
 async function fetchBestSubtitle(imdbId, config, options = {}) {
     const { season, episode } = options;
     const label = Number.isInteger(season) && Number.isInteger(episode)
         ? `${imdbId} S${season}E${episode}`
         : imdbId;
-    console.log(`[subtitleFetcher] 搜索 ${label} 的 ${config.sourceLang} 字幕...`);
+    const source = config.subtitleSource || 'auto';
 
-    const subtitles = await searchSubtitles(imdbId, config.sourceLang, config, { season, episode });
+    console.log(`[subtitleFetcher] 搜索 ${label} 的 ${config.sourceLang} 字幕（源: ${source}）...`);
 
-    if (subtitles.length === 0) {
-        console.log(`[subtitleFetcher] 未找到 ${config.sourceLang} 字幕`);
-        return null;
+    const runs = {
+        rest: fetchFromRest,
+        legacy: fetchFromLegacy,
+        cdn: fetchFromCdn,
+    };
+
+    const order = source === 'auto' ? ['rest', 'legacy', 'cdn'] : [source];
+
+    // auto 模式下，旧接口没有账号就下不到真字幕（只会拿到 VIP 占位文件），直接跳过
+    const hasLegacyAccount = !!(config.opensubtitlesUsername && config.opensubtitlesPassword);
+
+    for (const name of order) {
+        if (!runs[name]) continue;
+        if (name === 'legacy' && source === 'auto' && !hasLegacyAccount) {
+            console.log('[subtitleFetcher] 未配置 OpenSubtitles 账号，跳过旧接口（匿名下载只有占位字幕）');
+            continue;
+        }
+
+        try {
+            const result = await runs[name](imdbId, config, { season, episode });
+            if (result) {
+                return { ...result, source: name };
+            }
+            console.log(`[subtitleFetcher] ${name} 未取到可用字幕`);
+        } catch (error) {
+            console.error(`[subtitleFetcher] ${name} 出错: ${error.message}`);
+        }
     }
 
-    const best = pickBestSubtitle(subtitles);
-    console.log(`[subtitleFetcher] 找到 ${subtitles.length} 条字幕，选择: ${best.fileName}`);
-
-    const content = await downloadSubtitle(best.fileId, config);
-    if (!content) {
-        console.error('[subtitleFetcher] 下载字幕失败');
-        return null;
-    }
-
-    const entries = parseSubtitle(content);
-    console.log(`[subtitleFetcher] 解析到 ${entries.length} 条字幕`);
-
-    return { content, format: best.format, entries, subtitleInfo: best };
+    console.log(`[subtitleFetcher] 未找到 ${config.sourceLang} 字幕`);
+    return null;
 }
 
 module.exports = {
@@ -375,5 +462,8 @@ module.exports = {
     parseSubtitle,
     entriesToVTT,
     pickBestSubtitle,
+    fetchFromRest,
+    fetchFromLegacy,
+    fetchFromCdn,
     fetchBestSubtitle,
 };
